@@ -645,6 +645,249 @@ def replay_limited_counter_increment(
 
 
 @wp.kernel
+def prefilter_particles_pim(
+        # inputs
+        particle_x: wp.array(dtype=wp.vec3),
+        particle_flags: wp.array(dtype=wp.uint32),
+        body_X_wb: wp.array(dtype=wp.transform),
+        shape_X_bs: wp.array(dtype=wp.transform),
+        shape_body: wp.array(dtype=int),
+        geo: ModelShapeGeometry,
+        shape_count: int,
+        # outputs
+        result_mask: wp.array(dtype=int),
+):
+    tid = wp.tid()
+    particle_index, shape_index = tid // shape_count, tid % shape_count
+    if (particle_flags[particle_index] & PARTICLE_FLAG_ACTIVE) == 0:
+        return
+
+    rigid_index = shape_body[shape_index]
+
+    px = particle_x[particle_index]
+
+    X_wb = wp.transform_identity()
+    if rigid_index >= 0:
+        X_wb = body_X_wb[rigid_index]
+
+    X_bs = shape_X_bs[shape_index]
+
+    X_ws = wp.transform_multiply(X_wb, X_bs)
+    X_sw = wp.transform_inverse(X_ws)
+
+    # transform particle position to shape local space
+    x_local = wp.transform_point(X_sw, px)
+
+    # geo description
+    geo_scale = geo.scale[shape_index]
+
+    shell = geo.shell[shape_index]
+
+    if shell:
+        # Perform point-in-mesh (PIM) test
+        origin = wp.cw_div(x_local, geo_scale)  # Normalize position like before
+        direction = wp.vec3(1.0, 0.0, 0.0)  # Arbitrary fixed ray direction (e.g., +X)
+
+        t = float(0.0)
+        bary_u = float(0.0)
+        bary_v = float(0.0)
+        sign = float(0.0)
+        normal = wp.vec3(0.0, 0.0, 0.0)
+        face = int(0)
+
+        res = wp.mesh_query_ray(
+            shell,
+            origin,
+            direction,
+            1e1,
+            t,
+            bary_u,
+            bary_v,
+            sign,
+            normal,
+            face,
+        )
+
+        if res:
+            if sign > 0.0:
+                result_mask[tid] = 0
+                return
+            else:
+                result_mask[tid] = 1
+                return
+        else:
+            result_mask[tid] = 0
+            return
+    # Otherwise keep it
+    result_mask[tid] = 1
+
+@wp.kernel
+def arange(out: wp.array(dtype=int)):
+    tid = wp.tid()
+    out[tid] = tid
+
+@wp.kernel
+def compute_mask_sum(
+        mask: wp.array(dtype=int),
+        mask_sum: wp.array(dtype=int),
+):
+    tid = wp.tid()  # Thread ID (0 to len(mask) - 1)
+
+    # Atomically add the mask value to the sum
+    wp.atomic_add(mask_sum, 0, mask[tid])
+
+@wp.kernel
+def extract_scalar(
+        # input
+        arr: wp.array(dtype=int),
+        # output
+        out: wp.int32,
+):
+    out = wp.lower_bound(arr, 0)
+
+@wp.kernel
+def fill_with_minus_one(indices: wp.array(dtype=int)):
+    tid = wp.tid()
+    indices[tid] = -1
+
+@wp.kernel
+def generate_contact_indices(mask: wp.array(dtype=int), scan: wp.array(dtype=int), indices: wp.array(dtype=int)):
+    tid = wp.tid()
+    if mask[tid]:
+        indices[scan[tid]] = tid
+        # wp.atomic_add(indices, scan[tid], 0, tid)
+
+
+@wp.kernel
+def create_soft_contacts_compact(
+    particle_x: wp.array(dtype=wp.vec3),
+    particle_radius: wp.array(dtype=float),
+    particle_flags: wp.array(dtype=wp.uint32),
+    body_X_wb: wp.array(dtype=wp.transform),
+    shape_X_bs: wp.array(dtype=wp.transform),
+    shape_body: wp.array(dtype=int),
+    geo: ModelShapeGeometry,
+    margin: float,
+    soft_contact_max: int,
+    shape_count: int,
+    mask2tid: wp.array(dtype=int),
+    # outputs
+    soft_contact_count: wp.array(dtype=int),
+    soft_contact_particle: wp.array(dtype=int),
+    soft_contact_shape: wp.array(dtype=int),
+    soft_contact_body_pos: wp.array(dtype=wp.vec3),
+    soft_contact_body_vel: wp.array(dtype=wp.vec3),
+    soft_contact_normal: wp.array(dtype=wp.vec3),
+    soft_contact_tids: wp.array(dtype=int),
+):
+    mask, _ = wp.tid()
+    tid = mask2tid[mask]
+    if tid == -1:
+        print("tid == -1")
+        return
+
+    particle_index, shape_index = tid // shape_count, tid % shape_count
+    if (particle_flags[particle_index] & PARTICLE_FLAG_ACTIVE) == 0:
+        return
+
+    rigid_index = shape_body[shape_index]
+
+    px = particle_x[particle_index]
+    radius = particle_radius[particle_index]
+
+    X_wb = wp.transform_identity()
+    if rigid_index >= 0:
+        X_wb = body_X_wb[rigid_index]
+
+    X_bs = shape_X_bs[shape_index]
+
+    X_ws = wp.transform_multiply(X_wb, X_bs)
+    X_sw = wp.transform_inverse(X_ws)
+
+    # transform particle position to shape local space
+    x_local = wp.transform_point(X_sw, px)
+
+    # geo description
+    geo_type = geo.type[shape_index]
+    geo_scale = geo.scale[shape_index]
+
+    # evaluate shape sdf
+    d = 1.0e6
+    n = wp.vec3()
+    v = wp.vec3()
+
+    if geo_type == wp.sim.GEO_SPHERE:
+        d = sphere_sdf(wp.vec3(), geo_scale[0], x_local)
+        n = sphere_sdf_grad(wp.vec3(), geo_scale[0], x_local)
+
+    if geo_type == wp.sim.GEO_BOX:
+        d = box_sdf(geo_scale, x_local)
+        n = box_sdf_grad(geo_scale, x_local)
+
+    if geo_type == wp.sim.GEO_CAPSULE:
+        d = capsule_sdf(geo_scale[0], geo_scale[1], x_local)
+        n = capsule_sdf_grad(geo_scale[0], geo_scale[1], x_local)
+
+    if geo_type == wp.sim.GEO_CYLINDER:
+        d = cylinder_sdf(geo_scale[0], geo_scale[1], x_local)
+        n = cylinder_sdf_grad(geo_scale[0], geo_scale[1], x_local)
+
+    if geo_type == wp.sim.GEO_CONE:
+        d = cone_sdf(geo_scale[0], geo_scale[1], x_local)
+        n = cone_sdf_grad(geo_scale[0], geo_scale[1], x_local)
+
+    if geo_type == wp.sim.GEO_MESH:
+        mesh = geo.source[shape_index]
+
+        face_index = int(0)
+        face_u = float(0.0)
+        face_v = float(0.0)
+        sign = float(0.0)
+
+        min_scale = wp.min(geo_scale)
+        if wp.mesh_query_point_sign_normal(
+            mesh, wp.cw_div(x_local, geo_scale), margin + radius / min_scale, sign, face_index, face_u, face_v
+        ):
+            shape_p = wp.mesh_eval_position(mesh, face_index, face_u, face_v)
+            shape_v = wp.mesh_eval_velocity(mesh, face_index, face_u, face_v)
+
+            shape_p = wp.cw_mul(shape_p, geo_scale)
+            shape_v = wp.cw_mul(shape_v, geo_scale)
+
+            delta = x_local - shape_p
+
+            d = wp.length(delta) * sign
+            n = wp.normalize(delta) * sign
+            v = shape_v
+
+    if geo_type == wp.sim.GEO_SDF:
+        volume = geo.source[shape_index]
+        xpred_local = wp.volume_world_to_index(volume, wp.cw_div(x_local, geo_scale))
+        nn = wp.vec3(0.0, 0.0, 0.0)
+        d = wp.volume_sample_grad_f(volume, xpred_local, wp.Volume.LINEAR, nn)
+        n = wp.normalize(nn)
+
+    if geo_type == wp.sim.GEO_PLANE:
+        d = plane_sdf(geo_scale[0], geo_scale[1], x_local)
+        n = wp.vec3(0.0, 1.0, 0.0)
+
+    if d < margin + radius:
+        index = counter_increment(soft_contact_count, 0, soft_contact_tids, tid)
+
+        if index < soft_contact_max:
+            # compute contact point in body local space
+            body_pos = wp.transform_point(X_bs, x_local - n * d)
+            body_vel = wp.transform_vector(X_bs, v)
+
+            world_normal = wp.transform_vector(X_ws, n)
+
+            soft_contact_shape[index] = shape_index
+            soft_contact_body_pos[index] = body_pos
+            soft_contact_body_vel[index] = body_vel
+            soft_contact_particle[index] = particle_index
+            soft_contact_normal[index] = world_normal
+
+@wp.kernel
 def create_soft_contacts(
     particle_x: wp.array(dtype=wp.vec3),
     particle_radius: wp.array(dtype=float),
@@ -741,6 +984,47 @@ def create_soft_contacts(
             v = shape_v
 
     if geo_type == wp.sim.GEO_SDF:
+        # shell = geo.shell[shape_index] # The bounding shell (mesh) of the SDF.
+        # if shell:
+        #     min_scale = wp.min(geo_scale)
+        #     d = mesh_sdf(shell, wp.cw_div(x_local, geo_scale), margin + radius / min_scale)
+        #
+        #     if d >= margin + radius / min_scale:
+        #         return
+
+        # shell = geo.shell[shape_index] # The bounding shell (mesh) of the SDF.
+        #
+        # if shell:
+        #     # Perform point-in-mesh (PIM) test
+        #     origin = wp.cw_div(x_local, geo_scale)  # Normalize position like before
+        #     direction = wp.vec3(1.0, 0.0, 0.0)  # Arbitrary fixed ray direction (e.g., +X)
+        #
+        #     t = float(0.0)
+        #     bary_u = float(0.0)
+        #     bary_v = float(0.0)
+        #     sign = float(0.0)
+        #     normal = wp.vec3(0.0, 0.0, 0.0)
+        #     face = int(0)
+        #
+        #     res = wp.mesh_query_ray(
+        #         shell,
+        #         origin,
+        #         direction,
+        #         1e1,
+        #         t,
+        #         bary_u,
+        #         bary_v,
+        #         sign,
+        #         normal,
+        #         face,
+        #     )
+        #
+        #     if res:
+        #         if sign > 0.0:
+        #             return
+        #     else:
+        #         return
+
         volume = geo.source[shape_index]
         xpred_local = wp.volume_world_to_index(volume, wp.cw_div(x_local, geo_scale))
         nn = wp.vec3(0.0, 0.0, 0.0)
@@ -1556,6 +1840,47 @@ def handle_contact_pairs(
         contact_normal[index] = normal
         contact_thickness[index] = thickness
 
+def prefilter_particles(
+        model: Model,
+        state: State,
+) -> None:
+    if model.particle_count and model.shape_count > 1:
+        # clear old count
+        model.soft_contact_count.zero_()
+        model.soft_contact_mask = wp.zeros(model.particle_count * (model.shape_count - 1), dtype=int, device=model.device)
+        wp.launch(
+            kernel=prefilter_particles_pim,
+            dim=model.particle_count * (model.shape_count - 1),
+            inputs=[
+                state.particle_q,
+                model.particle_flags,
+                state.body_q,
+                model.shape_transform,
+                model.shape_body,
+                model.shape_geo,
+                model.shape_count - 1,
+            ],
+            outputs=[
+                model.soft_contact_mask,
+            ],
+            device=model.device,
+        )
+
+        model.potential_soft_contact_count = wp.zeros(1, dtype=int, device=model.device)
+        wp.launch(
+            kernel=compute_mask_sum,
+            dim=len(model.soft_contact_mask),
+            inputs=[model.soft_contact_mask],
+            outputs=[model.potential_soft_contact_count],
+            device=model.device,
+        )
+
+def allocate_compact_soft_contacts(
+        model: Model,
+) -> None:
+    potential_soft_contacts_count = int(model.potential_soft_contact_count.numpy()[0])
+    print(potential_soft_contacts_count * 1. / model.particle_count)
+    model.dense2sparse = wp.empty(potential_soft_contacts_count, dtype=int, device=model.device)
 
 def collide(
     model: Model,
@@ -1563,6 +1888,7 @@ def collide(
     edge_sdf_iter: int = 10,
     iterate_mesh_vertices: bool = True,
     requires_grad: Optional[bool] = None,
+    apply_particle_filter: bool = False,
 ) -> None:
     """Generate contact points for the particles and rigid bodies in the model for use in contact-dynamics kernels.
 
@@ -1579,7 +1905,7 @@ def collide(
     if requires_grad is None:
         requires_grad = model.requires_grad
 
-    with wp.ScopedTimer("collide", False):
+    with (wp.ScopedTimer("collide", False)):
         # generate soft contacts for particles and shapes except ground plane (last shape)
         if model.particle_count and model.shape_count > 1:
             if requires_grad:
@@ -1588,32 +1914,74 @@ def collide(
                 model.soft_contact_normal = wp.empty_like(model.soft_contact_normal)
             # clear old count
             model.soft_contact_count.zero_()
-            wp.launch(
-                kernel=create_soft_contacts,
-                dim=model.particle_count * (model.shape_count - 1),
-                inputs=[
-                    state.particle_q,
-                    model.particle_radius,
-                    model.particle_flags,
-                    state.body_q,
-                    model.shape_transform,
-                    model.shape_body,
-                    model.shape_geo,
-                    model.soft_contact_margin,
-                    model.soft_contact_max,
-                    model.shape_count - 1,
-                ],
-                outputs=[
-                    model.soft_contact_count,
-                    model.soft_contact_particle,
-                    model.soft_contact_shape,
-                    model.soft_contact_body_pos,
-                    model.soft_contact_body_vel,
-                    model.soft_contact_normal,
-                    model.soft_contact_tids,
-                ],
-                device=model.device,
-            )
+            if apply_particle_filter:
+                # Generate compacted indices via exclusive scan
+                scan_result = wp.empty_like(model.soft_contact_mask)
+
+                wp.utils.array_scan(in_array=model.soft_contact_mask, out_array=scan_result, inclusive=False)
+
+                wp.launch(
+                    kernel=generate_contact_indices,
+                    dim=len(model.soft_contact_mask),
+                    inputs=[model.soft_contact_mask, scan_result],
+                    outputs=[model.dense2sparse],
+                    device=model.device,
+                )
+
+                wp.launch(
+                    kernel=create_soft_contacts_compact,
+                    dim=len(model.dense2sparse),
+                    inputs=[
+                        state.particle_q,
+                        model.particle_radius,
+                        model.particle_flags,
+                        state.body_q,
+                        model.shape_transform,
+                        model.shape_body,
+                        model.shape_geo,
+                        model.soft_contact_margin,
+                        model.soft_contact_max,
+                        model.shape_count - 1,
+                        model.dense2sparse,
+                    ],
+                    outputs=[
+                        model.soft_contact_count,
+                        model.soft_contact_particle,
+                        model.soft_contact_shape,
+                        model.soft_contact_body_pos,
+                        model.soft_contact_body_vel,
+                        model.soft_contact_normal,
+                        model.soft_contact_tids,
+                    ],
+                    device=model.device,
+                )
+            else:
+                wp.launch(
+                    kernel=create_soft_contacts,
+                    dim=model.particle_count * (model.shape_count - 1),
+                    inputs=[
+                        state.particle_q,
+                        model.particle_radius,
+                        model.particle_flags,
+                        state.body_q,
+                        model.shape_transform,
+                        model.shape_body,
+                        model.shape_geo,
+                        model.soft_contact_margin,
+                        model.soft_contact_max,
+                        model.shape_count - 1,
+                    ],
+                    outputs=[
+                        model.soft_contact_count,
+                        model.soft_contact_particle,
+                        model.soft_contact_shape,
+                        model.soft_contact_body_pos,
+                        model.soft_contact_body_vel,
+                        model.soft_contact_normal,
+                        model.soft_contact_tids,
+                    ],
+                    device=model.device,
+                )
 
         if model.shape_contact_pair_count or (model.ground and model.shape_ground_contact_pair_count):
             # clear old count

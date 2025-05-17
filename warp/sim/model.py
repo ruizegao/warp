@@ -102,6 +102,7 @@ class ModelShapeGeometry:
         dtype=float
     )  # The thickness of the shape (used for collision detection, and inertia computation of hollow shapes)
     source: wp.array(dtype=wp.uint64)  # Pointer to the source geometry (in case of a mesh, zero otherwise)
+    shell: wp.array(dtype=wp.uint64) # Pointer to the bounding shell of the source geometry (in case of an SDF, zero otherwise)
     scale: wp.array(dtype=wp.vec3)  # The 3D scale of the shape
 
 
@@ -173,11 +174,14 @@ class SDF:
         com (Vec3): The center of mass of the SDF
     """
 
-    def __init__(self, volume=None, I=None, mass=1.0, com=None):
+    def __init__(self, volume=None, I=None, mass=1.0, com=None, shell_vertices=None, shell_indices=None):
         self.volume = volume
         self.I = I if I is not None else wp.mat33(np.eye(3))
         self.mass = mass
         self.com = com if com is not None else wp.vec3()
+        self.shell_vertices = np.array(shell_vertices).reshape(-1, 3) if shell_vertices is not None else None
+        self.shell_indices = np.array(shell_indices, dtype=np.int32).flatten() if shell_indices is not None else None
+
 
         # Need to specify these for now
         self.has_inertia = True
@@ -185,6 +189,17 @@ class SDF:
 
     def finalize(self, device=None):
         return self.volume.id
+
+    def finalize_shell(self, device=None):
+        if self.shell_vertices is not None and self.shell_indices is not None:
+            with wp.ScopedDevice(device):
+                pos = wp.array(self.shell_vertices, dtype=wp.vec3)
+                vel = wp.zeros_like(pos)
+                indices = wp.array(self.shell_indices, dtype=wp.int32)
+
+                self.shell = wp.Mesh(points=pos, velocities=vel, indices=indices)
+                return self.shell.id
+        return 0
 
     def __hash__(self):
         return hash(self.volume.id)
@@ -263,6 +278,9 @@ class Mesh:
 
             self.mesh = wp.Mesh(points=pos, velocities=vel, indices=indices)
             return self.mesh.id
+
+    def finalize_shell(self, device=None):
+        return 0
 
     def __hash__(self):
         """
@@ -716,6 +734,7 @@ class Model:
         self.shape_materials = ModelShapeMaterials()
         self.shape_geo = ModelShapeGeometry()
         self.shape_geo_src = None
+        # self.shape_geo_shell = None
 
         self.shape_collision_group = None
         self.shape_collision_group_map = None
@@ -1198,6 +1217,7 @@ class ModelBuilder:
         self.shape_geo_type = []
         self.shape_geo_scale = []
         self.shape_geo_src = []
+        # self.shape_geo_shell = []
         self.shape_geo_is_solid = []
         self.shape_geo_thickness = []
         self.shape_material_ke = []
@@ -1549,6 +1569,7 @@ class ModelBuilder:
             "shape_geo_type",
             "shape_geo_scale",
             "shape_geo_src",
+            "shape_geo_shell",
             "shape_geo_is_solid",
             "shape_geo_thickness",
             "shape_material_ke",
@@ -3341,6 +3362,7 @@ class ModelBuilder:
         pos: Vec3 | tuple[float, float, float] = (0.0, 0.0, 0.0),
         rot: Quat | tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0),
         sdf: SDF | None = None,
+        # shell: wp.Mesh | None = None,
         scale: Vec3 | tuple[float, float, float] = (1.0, 1.0, 1.0),
         density: float | None = None,
         ke: float | None = None,
@@ -3389,6 +3411,7 @@ class ModelBuilder:
             GEO_SDF,
             wp.vec3(scale[0], scale[1], scale[2]),
             sdf,
+            # shell,
             density,
             ke,
             kd,
@@ -3434,6 +3457,7 @@ class ModelBuilder:
         type,
         scale,
         src=None,
+        # shell=None,
         density=None,
         ke=None,
         kd=None,
@@ -3471,6 +3495,7 @@ class ModelBuilder:
         self.shape_geo_type.append(type)
         self.shape_geo_scale.append((scale[0], scale[1], scale[2]))
         self.shape_geo_src.append(src)
+        # self.shape_geo_shell.append(shell)
         self.shape_geo_thickness.append(thickness)
         self.shape_geo_is_solid.append(is_solid)
         self.shape_material_ke.append(ke)
@@ -4625,22 +4650,41 @@ class ModelBuilder:
             # build list of ids for geometry sources (meshes, sdfs)
             geo_sources = []
             finalized_meshes = {}  # do not duplicate meshes
+            geo_shells = []
+            finalized_shells = {}
             for geo in self.shape_geo_src:
                 geo_hash = hash(geo)  # avoid repeated hash computations
                 if geo:
                     if geo_hash not in finalized_meshes:
                         finalized_meshes[geo_hash] = geo.finalize(device=device)
+                    if geo_hash not in finalized_shells:
+                        finalized_shells[geo_hash] = geo.finalize_shell(device=device)
                     geo_sources.append(finalized_meshes[geo_hash])
+                    geo_shells.append(finalized_shells[geo_hash])
                 else:
                     # add null pointer
                     geo_sources.append(0)
+                    geo_shells.append(0)
 
+            # geo_shells = []
+            # finalized_shells = {}
+            # for geo in self.shape_geo_shell:
+            #     geo_hash = hash(geo)  # avoid repeated hash computations
+            #     if geo:
+            #         if geo_hash not in finalized_shells:
+            #             finalized_shells[geo_hash] = geo.id
+            #         geo_shells.append(geo_hash)
+            #     else:
+            #         # add null pointer
+            #         geo_shells.append(0)
             m.shape_geo.type = wp.array(self.shape_geo_type, dtype=wp.int32)
             m.shape_geo.source = wp.array(geo_sources, dtype=wp.uint64)
+            m.shape_geo.shell = wp.array(geo_shells, dtype=wp.uint64)
             m.shape_geo.scale = wp.array(self.shape_geo_scale, dtype=wp.vec3, requires_grad=requires_grad)
             m.shape_geo.is_solid = wp.array(self.shape_geo_is_solid, dtype=wp.uint8)
             m.shape_geo.thickness = wp.array(self.shape_geo_thickness, dtype=wp.float32, requires_grad=requires_grad)
             m.shape_geo_src = self.shape_geo_src  # used for rendering
+            # m.shape_geo_shell = self.shape_geo_shell
             # store refs to geometry
             m.geo_meshes = self.geo_meshes
             m.geo_sdfs = self.geo_sdfs

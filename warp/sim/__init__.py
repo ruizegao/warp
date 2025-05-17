@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from .articulation import eval_fk, eval_ik
-from .collide import collide
+from .collide import collide, prefilter_particles, allocate_compact_soft_contacts
 from .import_mjcf import parse_mjcf
 from .import_snu import parse_snu
 from .import_urdf import parse_urdf
