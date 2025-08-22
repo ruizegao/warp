@@ -984,47 +984,6 @@ def create_soft_contacts(
             v = shape_v
 
     if geo_type == wp.sim.GEO_SDF:
-        # shell = geo.shell[shape_index] # The bounding shell (mesh) of the SDF.
-        # if shell:
-        #     min_scale = wp.min(geo_scale)
-        #     d = mesh_sdf(shell, wp.cw_div(x_local, geo_scale), margin + radius / min_scale)
-        #
-        #     if d >= margin + radius / min_scale:
-        #         return
-
-        # shell = geo.shell[shape_index] # The bounding shell (mesh) of the SDF.
-        #
-        # if shell:
-        #     # Perform point-in-mesh (PIM) test
-        #     origin = wp.cw_div(x_local, geo_scale)  # Normalize position like before
-        #     direction = wp.vec3(1.0, 0.0, 0.0)  # Arbitrary fixed ray direction (e.g., +X)
-        #
-        #     t = float(0.0)
-        #     bary_u = float(0.0)
-        #     bary_v = float(0.0)
-        #     sign = float(0.0)
-        #     normal = wp.vec3(0.0, 0.0, 0.0)
-        #     face = int(0)
-        #
-        #     res = wp.mesh_query_ray(
-        #         shell,
-        #         origin,
-        #         direction,
-        #         1e1,
-        #         t,
-        #         bary_u,
-        #         bary_v,
-        #         sign,
-        #         normal,
-        #         face,
-        #     )
-        #
-        #     if res:
-        #         if sign > 0.0:
-        #             return
-        #     else:
-        #         return
-
         volume = geo.source[shape_index]
         xpred_local = wp.volume_world_to_index(volume, wp.cw_div(x_local, geo_scale))
         nn = wp.vec3(0.0, 0.0, 0.0)
