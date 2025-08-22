@@ -28,7 +28,7 @@ def test_tile_shared_mem_size(test, device):
 
     BLOCK_DIM = 256
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def compute(out: wp.array2d(dtype=float)):
         a = wp.tile_ones(shape=(DIM_M, DIM_N), dtype=float, storage="shared")
         b = wp.tile_ones(shape=(DIM_M, DIM_N), dtype=float, storage="shared") * 2.0
@@ -64,7 +64,7 @@ def test_tile_shared_mem_large(test, device):
     BLOCK_DIM = 256
 
     # we disable backward kernel gen since 128k is not supported on most architectures
-    @wp.kernel(enable_backward=False)
+    @wp.kernel(enable_backward=False, module="unique")
     def compute(out: wp.array2d(dtype=float)):
         a = wp.tile_ones(shape=(DIM_M, DIM_N), dtype=float, storage="shared")
         b = wp.tile_ones(shape=(DIM_M, DIM_N), dtype=float, storage="shared") * 2.0
@@ -100,7 +100,7 @@ def test_tile_shared_mem_graph(test, device):
 
     BLOCK_DIM = 256
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def compute(out: wp.array2d(dtype=float)):
         a = wp.tile_ones(shape=(DIM_M, DIM_N), dtype=float, storage="shared")
         b = wp.tile_ones(shape=(DIM_M, DIM_N), dtype=float, storage="shared") * 2.0
@@ -110,13 +110,13 @@ def test_tile_shared_mem_graph(test, device):
 
     out = wp.empty((DIM_M, DIM_N), dtype=float, device=device)
 
-    wp.load_module(device=device)
+    # preload the unique module
+    wp.load_module(compute.module, device=device, block_dim=BLOCK_DIM)
 
-    wp.capture_begin(device, force_module_load=False)
-    wp.launch_tiled(compute, dim=[1], inputs=[out], block_dim=BLOCK_DIM, device=device)
-    graph = wp.capture_end(device)
+    with wp.ScopedCapture(device, force_module_load=False) as capture:
+        wp.launch_tiled(compute, dim=[1], inputs=[out], block_dim=BLOCK_DIM, device=device)
 
-    wp.capture_launch(graph)
+    wp.capture_launch(capture.graph)
 
     # check output
     assert_np_equal(out.numpy(), np.ones((DIM_M, DIM_N)) * 3.0)
@@ -157,7 +157,7 @@ def test_tile_shared_mem_func(test, device):
 
         return a + b
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def compute(out: wp.array2d(dtype=float)):
         s = add_tile_small()
         b = add_tile_big()
@@ -197,7 +197,7 @@ def test_tile_shared_non_aligned(test, device):
         b = wp.tile_ones(shape=(DIM_M, DIM_N), dtype=float, storage="shared") * 3.0
         return a + b
 
-    @wp.kernel
+    @wp.kernel(module="unique")
     def compute(out: wp.array2d(dtype=float)):
         # This test the logic in the stack allocator, which should increment and
         # decrement the stack pointer each time foo() is called
@@ -224,6 +224,121 @@ def test_tile_shared_non_aligned(test, device):
     assert hooks.backward_smem_bytes == expected_required_shared * 2
 
 
+def test_tile_shared_vec_accumulation(test, device):
+    BLOCK_DIM = 256
+
+    @wp.kernel(module="unique")
+    def compute(indices: wp.array(dtype=int), vecs: wp.array(dtype=wp.vec3), output: wp.array2d(dtype=float)):
+        i, j = wp.tid()
+
+        idx_tile = wp.tile_load(indices, shape=BLOCK_DIM, offset=i * BLOCK_DIM)
+        idx = idx_tile[j]
+
+        s = wp.tile_zeros(shape=(1, 3), dtype=float)
+
+        s[0, 0] += vecs[idx].x
+        s[0, 1] += vecs[idx].y
+        s[0, 2] += vecs[idx].z
+
+        wp.tile_store(output, s, offset=(i, 0))
+
+    N = BLOCK_DIM * 3
+
+    basis_vecs = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+    vecs = wp.array(basis_vecs, dtype=wp.vec3, requires_grad=True, device=device)
+
+    rng = np.random.default_rng(42)
+    indices_np = rng.integers(0, 3, size=N)
+
+    indices = wp.array(indices_np, dtype=int, requires_grad=True, device=device)
+
+    output = wp.zeros(shape=(3, 3), dtype=float, requires_grad=True, device=device)
+
+    tape = wp.Tape()
+    with tape:
+        wp.launch_tiled(compute, dim=3, inputs=[indices, vecs, output], block_dim=BLOCK_DIM, device=device)
+
+    output.grad = wp.ones_like(output)
+
+    tape.backward()
+
+    n0 = np.count_nonzero(indices_np == 0)
+    n1 = np.count_nonzero(indices_np == 1)
+    n2 = np.count_nonzero(indices_np == 2)
+    true_grads = np.array([[n0, n0, n0], [n1, n1, n1], [n2, n2, n2]])
+
+    indices_np = indices_np.reshape((3, BLOCK_DIM))
+
+    def compute_row(idx):
+        n0 = np.count_nonzero(indices_np[idx, :] == 0)
+        n1 = np.count_nonzero(indices_np[idx, :] == 1)
+        n2 = np.count_nonzero(indices_np[idx, :] == 2)
+        return np.array([1, 0, 0]) * n0 + np.array([0, 1, 0]) * n1 + np.array([0, 0, 1]) * n2
+
+    row_0 = compute_row(0)
+    row_1 = compute_row(1)
+    row_2 = compute_row(2)
+
+    true_vecs = np.stack([row_0, row_1, row_2])
+
+    assert_np_equal(output.numpy(), true_vecs)
+    assert_np_equal(vecs.grad.numpy(), true_grads)
+
+
+def test_tile_shared_simple_reduction_add(test, device):
+    BLOCK_DIM = 256
+
+    @wp.kernel(module="unique")
+    def compute(x: wp.array(dtype=float), y: wp.array(dtype=float)):
+        i, j = wp.tid()
+
+        t = wp.tile_load(x, shape=BLOCK_DIM, offset=BLOCK_DIM * i)
+
+        k = BLOCK_DIM // 2
+        while k > 0:
+            if j < k:
+                t[j] += t[j + k]
+            k //= 2
+
+        wp.tile_store(y, wp.tile_view(t, offset=(0,), shape=(1,)), i)
+
+    N = BLOCK_DIM * 4
+    x_np = np.arange(N, dtype=np.float32)
+    x = wp.array(x_np, dtype=float, device=device)
+    y = wp.zeros(4, dtype=float, device=device)
+
+    wp.launch_tiled(compute, dim=4, inputs=[x], outputs=[y], block_dim=BLOCK_DIM, device=device)
+
+    assert_np_equal(np.sum(y.numpy()), np.sum(x_np))
+
+
+def test_tile_shared_simple_reduction_sub(test, device):
+    BLOCK_DIM = 256
+
+    @wp.kernel(module="unique")
+    def compute(x: wp.array(dtype=float), y: wp.array(dtype=float)):
+        i, j = wp.tid()
+
+        t = wp.tile_load(x, shape=BLOCK_DIM, offset=BLOCK_DIM * i)
+
+        k = BLOCK_DIM // 2
+        while k > 0:
+            if j < k:
+                t[j] -= t[j + k]
+            k //= 2
+
+        wp.tile_store(y, wp.tile_view(t, offset=(0,), shape=(1,)), i)
+
+    N = BLOCK_DIM * 4
+    x_np = np.arange(N, dtype=np.float32)
+    x = wp.array(x_np, dtype=float, device=device)
+    y = wp.zeros(4, dtype=float, device=device)
+
+    wp.launch_tiled(compute, dim=4, inputs=[x], outputs=[y], block_dim=BLOCK_DIM, device=device)
+
+    assert_np_equal(np.sum(y.numpy()), 0.0)
+
+
 devices = get_cuda_test_devices()
 
 
@@ -240,7 +355,21 @@ add_function_test(
 add_function_test(TestTileSharedMemory, "test_tile_shared_mem_graph", test_tile_shared_mem_graph, devices=devices)
 add_function_test(TestTileSharedMemory, "test_tile_shared_mem_func", test_tile_shared_mem_func, devices=devices)
 add_function_test(TestTileSharedMemory, "test_tile_shared_non_aligned", test_tile_shared_non_aligned, devices=devices)
-
+add_function_test(
+    TestTileSharedMemory, "test_tile_shared_vec_accumulation", test_tile_shared_vec_accumulation, devices=devices
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_shared_simple_reduction_add",
+    test_tile_shared_simple_reduction_add,
+    devices=devices,
+)
+add_function_test(
+    TestTileSharedMemory,
+    "test_tile_shared_simple_reduction_sub",
+    test_tile_shared_simple_reduction_sub,
+    devices=devices,
+)
 
 if __name__ == "__main__":
     wp.clear_kernel_cache()

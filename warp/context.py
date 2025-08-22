@@ -26,6 +26,7 @@ import json
 import operator
 import os
 import platform
+import shutil
 import sys
 import types
 import typing
@@ -36,6 +37,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     List,
     Literal,
     Mapping,
@@ -131,6 +133,7 @@ class Function:
         variadic: bool = False,
         initializer_list_func: Callable[[dict[str, Any], type], bool] | None = None,
         export: bool = False,
+        source: str | None = None,
         doc: str = "",
         group: str = "",
         hidden: bool = False,
@@ -215,6 +218,7 @@ class Function:
             # user defined (Python) function
             self.adj = warp.codegen.Adjoint(
                 func,
+                source=source,
                 is_user_function=True,
                 skip_forward_codegen=skip_forward_codegen,
                 skip_reverse_codegen=skip_reverse_codegen,
@@ -291,10 +295,11 @@ class Function:
             module.register_function(self, scope_locals, skip_adding_overload)
 
     def __call__(self, *args, **kwargs):
-        # handles calling a builtin (native) function
-        # as if it was a Python function, i.e.: from
-        # within the CPython interpreter rather than
-        # from within a kernel (experimental).
+        """Call this function from the CPython interpreter.
+
+        This is used to call built-in or user functions from the CPython
+        interpreter, rather than from within a kernel.
+        """
 
         if self.is_builtin() and self.mangled_name:
             # For each of this function's existing overloads, we attempt to pack
@@ -337,20 +342,24 @@ class Function:
                 warp.codegen.apply_defaults(bound_args, self.defaults)
 
             arguments = tuple(bound_args.arguments.values())
+            arg_types = tuple(warp.codegen.get_arg_type(x) for x in arguments)
 
             # try and find a matching overload
             for overload in self.user_overloads.values():
                 if len(overload.input_types) != len(arguments):
                     continue
-                template_types = list(overload.input_types.values())
-                arg_names = list(overload.input_types.keys())
-                try:
-                    # attempt to unify argument types with function template types
-                    warp.types.infer_argument_types(arguments, template_types, arg_names)
-                    return overload.func(*arguments)
-                except Exception:
+
+                if not warp.codegen.func_match_args(overload, arg_types, {}):
                     continue
 
+                template_types = list(overload.input_types.values())
+                arg_names = list(overload.input_types.keys())
+
+                # attempt to unify argument types with function template types
+                warp.types.infer_argument_types(arguments, template_types, arg_names)
+                return overload.func(*arguments)
+
+            # We got here without ever calling an overload.func
             raise RuntimeError(f"Error calling function '{self.key}', no overload found for arguments {args}")
 
         # user-defined function with no overloads
@@ -377,7 +386,7 @@ class Function:
     def mangle(self) -> str:
         """Build a mangled name for the C-exported function, e.g.: `builtin_normalize_vec3()`."""
 
-        name = "builtin_" + self.key
+        name = "wp_builtin_" + self.key
 
         # Runtime arguments that are to be passed to the function, not its template signature.
         if self.export_func is not None:
@@ -416,7 +425,11 @@ class Function:
                 self.user_overloads[sig] = f
 
     def get_overload(self, arg_types: list[type], kwarg_types: Mapping[str, type]) -> Function | None:
-        assert not self.is_builtin()
+        if self.is_builtin():
+            for f in self.overloads:
+                if warp.codegen.func_match_args(f, arg_types, kwarg_types):
+                    return f
+            return None
 
         for f in self.user_overloads.values():
             if warp.codegen.func_match_args(f, arg_types, kwarg_types):
@@ -450,7 +463,7 @@ class Function:
                         overload_annotations[k] = warp.codegen.strip_reference(warp.codegen.get_arg_type(d))
 
                 ovl = shallowcopy(f)
-                ovl.adj = warp.codegen.Adjoint(f.func, overload_annotations)
+                ovl.adj = warp.codegen.Adjoint(f.func, overload_annotations, source=f.adj.source)
                 ovl.input_types = overload_annotations
                 ovl.value_func = None
                 ovl.generic_parent = f
@@ -462,6 +475,25 @@ class Function:
 
         # failed  to find overload
         return None
+
+    def build(self, builder: ModuleBuilder | None):
+        self.adj.build(builder)
+
+        # complete the function return type after we have analyzed it (inferred from return statement in ast)
+        if not self.value_func:
+
+            def wrap(adj):
+                def value_type(arg_types, arg_values):
+                    if adj.return_var is None or len(adj.return_var) == 0:
+                        return None
+                    if len(adj.return_var) == 1:
+                        return adj.return_var[0].type
+                    else:
+                        return [v.type for v in adj.return_var]
+
+                return value_type
+
+            self.value_func = wrap(self.adj)
 
     def __repr__(self):
         inputs_str = ", ".join([f"{k}: {warp.types.type_repr(v)}" for k, v in self.input_types.items()])
@@ -501,6 +533,9 @@ def call_builtin(func: Function, params: tuple) -> tuple[bool, Any]:
     uses_non_warp_array_type = False
 
     init()
+
+    if func.mangled_name is None:
+        return (False, None)
 
     # Retrieve the built-in function from Warp's dll.
     c_func = getattr(warp.context.runtime.core, func.mangled_name)
@@ -645,7 +680,7 @@ def call_builtin(func: Function, params: tuple) -> tuple[bool, Any]:
                 c_params.append(arg_type._type_(param))
 
     # Retrieve the return type.
-    value_type = func.value_func(None, None)
+    value_type = func.value_func(func_args, None)
 
     if value_type is not None:
         if not isinstance(value_type, Sequence):
@@ -691,7 +726,7 @@ class KernelHooks:
 
 # caches source and compiled entry points for a kernel (will be populated after module loads)
 class Kernel:
-    def __init__(self, func, key=None, module=None, options=None, code_transformers=None):
+    def __init__(self, func, key=None, module=None, options=None, code_transformers=None, source=None):
         self.func = func
 
         if module is None:
@@ -709,7 +744,7 @@ class Kernel:
         if code_transformers is None:
             code_transformers = []
 
-        self.adj = warp.codegen.Adjoint(func, transformers=code_transformers)
+        self.adj = warp.codegen.Adjoint(func, transformers=code_transformers, source=source)
 
         # check if generic
         self.is_generic = False
@@ -776,7 +811,7 @@ class Kernel:
 
         # instantiate this kernel with the given argument types
         ovl = shallowcopy(self)
-        ovl.adj = warp.codegen.Adjoint(self.func, overload_annotations)
+        ovl.adj = warp.codegen.Adjoint(self.func, overload_annotations, source=self.adj.source)
         ovl.is_generic = False
         ovl.overloads = {}
         ovl.sig = sig
@@ -792,14 +827,17 @@ class Kernel:
         sig = warp.types.get_signature(arg_types, func_name=self.key)
         return self.overloads.get(sig)
 
-    def get_mangled_name(self):
-        if self.hash is None:
-            raise RuntimeError(f"Missing hash for kernel {self.key} in module {self.module.name}")
+    def get_mangled_name(self) -> str:
+        if self.module.options["strip_hash"]:
+            return self.key
+        else:
+            if self.hash is None:
+                raise RuntimeError(f"Missing hash for kernel {self.key} in module {self.module.name}")
 
-        # TODO: allow customizing the number of hash characters used
-        hash_suffix = self.hash.hex()[:8]
+            # TODO: allow customizing the number of hash characters used
+            hash_suffix = self.hash.hex()[:8]
 
-        return f"{self.key}_{hash_suffix}"
+            return f"{self.key}_{hash_suffix}"
 
     def __call__(self, *args, **kwargs):
         # we implement this function only to ensure Kernel is a callable object
@@ -1106,7 +1144,7 @@ def kernel(
 # decorator to register struct, @struct
 def struct(c: type):
     m = get_module(c.__module__)
-    s = warp.codegen.Struct(cls=c, key=warp.codegen.make_full_qualified_name(c), module=m)
+    s = warp.codegen.Struct(key=warp.codegen.make_full_qualified_name(c), cls=c, module=m)
     s = functools.update_wrapper(s, c)
     return s
 
@@ -1472,6 +1510,24 @@ def register_api_function(
     """
     function.group = group
     function.hidden = hidden
+
+    # Update the docstring to mark these functions as being available from kernels and Python's runtime.
+    assert function.__doc__.startswith("\n")
+    leading_space_count = sum(1 for _ in itertools.takewhile(str.isspace, function.__doc__[1:]))
+    assert leading_space_count % 4 == 0
+    indent_level = leading_space_count // 4
+    indent = "    "
+    function.__doc__ = (
+        f"\n"
+        f"{indent * indent_level}.. hlist::\n"
+        f"{indent * (indent_level + 1)}:columns: 8\n"
+        f"\n"
+        f"{indent * (indent_level + 1)}* Kernel\n"
+        f"{indent * (indent_level + 1)}* Python\n"
+        f"{indent * (indent_level + 1)}* Differentiable\n"
+        f"{function.__doc__}"
+    )
+
     builtin_functions[function.key] = function
 
 
@@ -1563,6 +1619,9 @@ class ModuleHasher:
 
         # line directives, e.g. for Nsight Compute
         ch.update(bytes(ctypes.c_int(warp.config.line_directives)))
+
+        # whether to use `assign_copy` instead of `assign_inplace`
+        ch.update(bytes(ctypes.c_int(warp.config.enable_vector_component_overwrites)))
 
         # build config
         ch.update(bytes(warp.config.mode, "utf-8"))
@@ -1659,7 +1718,7 @@ class ModuleHasher:
             ch.update(bytes(name, "utf-8"))
             ch.update(self.get_constant_bytes(value))
 
-        # hash wp.static() expressions that were evaluated at declaration time
+        # hash wp.static() expressions
         for k, v in adj.static_expressions.items():
             ch.update(bytes(k, "utf-8"))
             if isinstance(v, Function):
@@ -1751,6 +1810,9 @@ class ModuleBuilder:
         self.structs[struct] = None
 
     def build_kernel(self, kernel):
+        if kernel.options.get("enable_backward", True):
+            kernel.adj.used_by_backward_kernel = True
+
         kernel.adj.build(self)
 
         if kernel.adj.return_var is not None:
@@ -1761,23 +1823,7 @@ class ModuleBuilder:
         if func in self.functions:
             return
         else:
-            func.adj.build(self)
-
-            # complete the function return type after we have analyzed it (inferred from return statement in ast)
-            if not func.value_func:
-
-                def wrap(adj):
-                    def value_type(arg_types, arg_values):
-                        if adj.return_var is None or len(adj.return_var) == 0:
-                            return None
-                        if len(adj.return_var) == 1:
-                            return adj.return_var[0].type
-                        else:
-                            return [v.type for v in adj.return_var]
-
-                    return value_type
-
-                func.value_func = wrap(func.adj)
+            func.build(self)
 
             # use dict to preserve import order
             self.functions[func] = None
@@ -1797,10 +1843,11 @@ class ModuleBuilder:
         source = ""
 
         # code-gen LTO forward declarations
-        source += 'extern "C" {\n'
-        for fwd in self.ltoirs_decl.values():
-            source += fwd + "\n"
-        source += "}\n"
+        if len(self.ltoirs_decl) > 0:
+            source += 'extern "C" {\n'
+            for fwd in self.ltoirs_decl.values():
+                source += fwd + "\n"
+            source += "}\n"
 
         # code-gen structs
         visited_structs = set()
@@ -1865,9 +1912,9 @@ class ModuleExec:
             if self.device.is_cuda:
                 # use CUDA context guard to avoid side effects during garbage collection
                 with self.device.context_guard:
-                    runtime.core.cuda_unload_module(self.device.context, self.handle)
+                    runtime.core.wp_cuda_unload_module(self.device.context, self.handle)
             else:
-                runtime.llvm.unload_obj(self.handle.encode("utf-8"))
+                runtime.llvm.wp_unload_obj(self.handle.encode("utf-8"))
 
     # lookup and cache kernel entry points
     def get_kernel_hooks(self, kernel) -> KernelHooks:
@@ -1885,13 +1932,13 @@ class ModuleExec:
 
         if self.device.is_cuda:
             forward_name = name + "_cuda_kernel_forward"
-            forward_kernel = runtime.core.cuda_get_kernel(
+            forward_kernel = runtime.core.wp_cuda_get_kernel(
                 self.device.context, self.handle, forward_name.encode("utf-8")
             )
 
             if options["enable_backward"]:
                 backward_name = name + "_cuda_kernel_backward"
-                backward_kernel = runtime.core.cuda_get_kernel(
+                backward_kernel = runtime.core.wp_cuda_get_kernel(
                     self.device.context, self.handle, backward_name.encode("utf-8")
                 )
             else:
@@ -1902,14 +1949,14 @@ class ModuleExec:
             backward_smem_bytes = self.meta[backward_name + "_smem_bytes"] if options["enable_backward"] else 0
 
             # configure kernels maximum shared memory size
-            max_smem_bytes = runtime.core.cuda_get_max_shared_memory(self.device.context)
+            max_smem_bytes = runtime.core.wp_cuda_get_max_shared_memory(self.device.context)
 
-            if not runtime.core.cuda_configure_kernel_shared_memory(forward_kernel, forward_smem_bytes):
+            if not runtime.core.wp_cuda_configure_kernel_shared_memory(forward_kernel, forward_smem_bytes):
                 print(
                     f"Warning: Failed to configure kernel dynamic shared memory for this device, tried to configure {forward_name} kernel for {forward_smem_bytes} bytes, but maximum available is {max_smem_bytes}"
                 )
 
-            if options["enable_backward"] and not runtime.core.cuda_configure_kernel_shared_memory(
+            if options["enable_backward"] and not runtime.core.wp_cuda_configure_kernel_shared_memory(
                 backward_kernel, backward_smem_bytes
             ):
                 print(
@@ -1921,12 +1968,13 @@ class ModuleExec:
         else:
             func = ctypes.CFUNCTYPE(None)
             forward = (
-                func(runtime.llvm.lookup(self.handle.encode("utf-8"), (name + "_cpu_forward").encode("utf-8"))) or None
+                func(runtime.llvm.wp_lookup(self.handle.encode("utf-8"), (name + "_cpu_forward").encode("utf-8")))
+                or None
             )
 
             if options["enable_backward"]:
                 backward = (
-                    func(runtime.llvm.lookup(self.handle.encode("utf-8"), (name + "_cpu_backward").encode("utf-8")))
+                    func(runtime.llvm.wp_lookup(self.handle.encode("utf-8"), (name + "_cpu_backward").encode("utf-8")))
                     or None
                 )
             else:
@@ -1936,6 +1984,25 @@ class ModuleExec:
 
         self.kernel_hooks[kernel.adj] = hooks
         return hooks
+
+
+def _check_and_raise_long_path_error(e: FileNotFoundError):
+    """Check if the error is due to a Windows long path and provide work-around instructions if it is.
+
+    ``FileNotFoundError.filename`` may legitimately be ``None`` when the originating
+    API does not supply a path.  Guard against that to avoid masking the original
+    error with a ``TypeError``.
+    """
+    filename = getattr(e, "filename", None)
+
+    # Fast-exit when this is clearly not a legacy-path limitation:
+    if filename is None or len(filename) < 260 or os.name != "nt" or filename.startswith("\\\\?\\"):
+        raise e
+
+    raise RuntimeError(
+        f"File path '{e.filename}' exceeds 259 characters, long-path support is required for this operation. "
+        "See https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation for more information."
+    ) from e
 
 
 # -----------------------------------------------------
@@ -1978,6 +2045,9 @@ class Module:
         # is retained and later reloaded with the same hash.
         self.cpu_exec_id = 0
 
+        # Indicates whether the module has functions or kernels with unresolved static expressions.
+        self.has_unresolved_static_expressions = False
+
         self.options = {
             "max_unroll": warp.config.max_unroll,
             "enable_backward": warp.config.enable_backward,
@@ -1985,9 +2055,10 @@ class Module:
             "fuse_fp": True,
             "lineinfo": warp.config.lineinfo,
             "cuda_output": None,  # supported values: "ptx", "cubin", or None (automatic)
-            "mode": warp.config.mode,
+            "mode": None,
             "block_dim": 256,
             "compile_time_trace": warp.config.compile_time_trace,
+            "strip_hash": False,
         }
 
         # Module dependencies are determined by scanning each function
@@ -2013,6 +2084,10 @@ class Module:
 
         # track all kernel objects, even if they are duplicates
         self._live_kernels.add(kernel)
+
+        # Check for unresolved static expressions in the kernel.
+        if kernel.adj.has_unresolved_static_expressions:
+            self.has_unresolved_static_expressions = True
 
         self.find_references(kernel.adj)
 
@@ -2073,6 +2148,10 @@ class Module:
                                 del func_existing.user_overloads[k]
                 func_existing.add_overload(func)
 
+        # Check for unresolved static expressions in the function.
+        if func.adj.has_unresolved_static_expressions:
+            self.has_unresolved_static_expressions = True
+
         self.find_references(func.adj)
 
         # for a reload of module on next launch
@@ -2126,13 +2205,333 @@ class Module:
             if isinstance(arg.type, warp.codegen.Struct) and arg.type.module is not None:
                 add_ref(arg.type.module)
 
-    def hash_module(self):
+    def hash_module(self) -> bytes:
+        """Get the hash of the module for the current block_dim.
+
+        This function always creates a new `ModuleHasher` instance and computes the hash.
+        """
         # compute latest hash
         block_dim = self.options["block_dim"]
         self.hashers[block_dim] = ModuleHasher(self)
         return self.hashers[block_dim].get_module_hash()
 
-    def load(self, device, block_dim=None) -> ModuleExec:
+    def get_module_hash(self, block_dim: int | None = None) -> bytes:
+        """Get the hash of the module for the current block_dim.
+
+        If a hash has not been computed for the current block_dim, it will be computed and cached.
+        """
+        if block_dim is None:
+            block_dim = self.options["block_dim"]
+
+        if self.has_unresolved_static_expressions:
+            # The module hash currently does not account for unresolved static expressions
+            # (only static expressions evaluated at declaration time so far).
+            # We need to generate the code for the functions and kernels that have
+            # unresolved static expressions and then compute the module hash again.
+            builder_options = {
+                **self.options,
+                "output_arch": None,
+            }
+            # build functions, kernels to resolve static expressions
+            _ = ModuleBuilder(self, builder_options)
+
+            self.has_unresolved_static_expressions = False
+
+        # compute the hash if needed
+        if block_dim not in self.hashers:
+            self.hashers[block_dim] = ModuleHasher(self)
+
+        return self.hashers[block_dim].get_module_hash()
+
+    def _use_ptx(self, device) -> bool:
+        # determine whether to use PTX or CUBIN
+        if device.is_cubin_supported:
+            # get user preference specified either per module or globally
+            preferred_cuda_output = self.options.get("cuda_output") or warp.config.cuda_output
+            if preferred_cuda_output is not None:
+                use_ptx = preferred_cuda_output == "ptx"
+            else:
+                # determine automatically: older drivers may not be able to handle PTX generated using newer
+                # CUDA Toolkits, in which case we fall back on generating CUBIN modules
+                use_ptx = runtime.driver_version >= runtime.toolkit_version
+        else:
+            # CUBIN not an option, must use PTX (e.g. CUDA Toolkit too old)
+            use_ptx = True
+
+        return use_ptx
+
+    def get_module_identifier(self) -> str:
+        """Get an abbreviated module name to use for directories and files in the cache.
+
+        Depending on the setting of the ``"strip_hash"`` option for this module,
+        the module identifier might include a content-dependent hash as a suffix.
+        """
+        if self.options["strip_hash"]:
+            module_name_short = f"wp_{self.name}"
+        else:
+            module_hash = self.get_module_hash()
+            module_name_short = f"wp_{self.name}_{module_hash.hex()[:7]}"
+
+        return module_name_short
+
+    def get_compile_arch(self, device: Device | None = None) -> int | None:
+        if device is None:
+            device = runtime.get_device()
+
+        if device.is_cpu:
+            return None
+
+        if self._use_ptx(device):
+            # use the default PTX arch if the device supports it
+            if warp.config.ptx_target_arch is not None:
+                output_arch = min(device.arch, warp.config.ptx_target_arch)
+            else:
+                output_arch = min(device.arch, runtime.default_ptx_arch)
+        else:
+            output_arch = device.arch
+
+        return output_arch
+
+    def get_compile_output_name(
+        self, device: Device | None, output_arch: int | None = None, use_ptx: bool | None = None
+    ) -> str:
+        """Get the filename to use for the compiled module binary.
+
+        This is only the filename, e.g. ``wp___main___0340cd1.sm86.ptx``.
+        It should be used to form a path.
+        """
+        module_name_short = self.get_module_identifier()
+
+        if device and device.is_cpu:
+            return f"{module_name_short}.o"
+
+        # For CUDA compilation, we must have an architecture.
+        final_arch = output_arch
+        if final_arch is None:
+            if device:
+                # Infer the architecture from the device
+                final_arch = self.get_compile_arch(device)
+            else:
+                raise ValueError(
+                    "Either 'device' or 'output_arch' must be provided to determine compilation architecture"
+                )
+
+        # Determine if we should compile to PTX or CUBIN
+        if use_ptx is None:
+            if device:
+                use_ptx = self._use_ptx(device)
+            else:
+                init()
+                use_ptx = final_arch not in runtime.nvrtc_supported_archs
+
+        if use_ptx:
+            output_name = f"{module_name_short}.sm{final_arch}.ptx"
+        else:
+            output_name = f"{module_name_short}.sm{final_arch}.cubin"
+
+        return output_name
+
+    def get_meta_name(self) -> str:
+        """Get the filename to use for the module metadata file.
+
+        This is only the filename. It should be used to form a path.
+        """
+        return f"{self.get_module_identifier()}.meta"
+
+    def compile(
+        self,
+        device: Device | None = None,
+        output_dir: str | os.PathLike | None = None,
+        output_name: str | None = None,
+        output_arch: int | None = None,
+        use_ptx: bool | None = None,
+    ) -> None:
+        """Compile this module for a specific device.
+
+        Note that this function only generates and compiles code. The resulting
+        binary is not loaded into the runtime.
+
+        Args:
+            device: The device to compile the module for.
+            output_dir: The directory to write the compiled module to.
+            output_name: The name of the compiled module binary file.
+            output_arch: The architecture to compile the module for.
+        """
+        if output_arch is None:
+            output_arch = self.get_compile_arch(device)  # Will remain at None if device is CPU
+
+        if output_name is None:
+            output_name = self.get_compile_output_name(device, output_arch, use_ptx)
+
+        builder_options = {
+            **self.options,
+            # Some of the tile codegen, such as cuFFTDx and cuBLASDx, requires knowledge of the target arch
+            "output_arch": output_arch,
+        }
+        builder = ModuleBuilder(
+            self,
+            builder_options,
+            hasher=self.hashers.get(self.options["block_dim"], None),
+        )
+
+        # create a temporary (process unique) dir for build outputs before moving to the binary dir
+        module_name_short = self.get_module_identifier()
+
+        if output_dir is None:
+            output_dir = os.path.join(warp.config.kernel_cache_dir, f"{module_name_short}")
+        else:
+            output_dir = os.fspath(output_dir)
+
+        meta_path = os.path.join(output_dir, self.get_meta_name())
+
+        build_dir = os.path.normpath(output_dir) + f"_p{os.getpid()}"
+
+        # dir may exist from previous attempts / runs / archs
+        Path(build_dir).mkdir(parents=True, exist_ok=True)
+
+        mode = self.options["mode"] if self.options["mode"] is not None else warp.config.mode
+
+        # build CPU
+        if output_arch is None:
+            # build
+            try:
+                source_code_path = os.path.join(build_dir, f"{module_name_short}.cpp")
+
+                # write cpp sources
+                cpp_source = builder.codegen("cpu")
+
+                with open(source_code_path, "w") as cpp_file:
+                    cpp_file.write(cpp_source)
+
+                output_path = os.path.join(build_dir, output_name)
+
+                # build object code
+                with warp.ScopedTimer("Compile x86", active=warp.config.verbose):
+                    warp.build.build_cpu(
+                        output_path,
+                        source_code_path,
+                        mode=mode,
+                        fast_math=self.options["fast_math"],
+                        verify_fp=warp.config.verify_fp,
+                        fuse_fp=self.options["fuse_fp"],
+                    )
+
+            except Exception as e:
+                if isinstance(e, FileNotFoundError):
+                    _check_and_raise_long_path_error(e)
+
+                self.failed_builds.add(None)
+
+                # clean up build_dir used for this process regardless
+                shutil.rmtree(build_dir, ignore_errors=True)
+
+                raise (e)
+
+        else:
+            # build
+            try:
+                source_code_path = os.path.join(build_dir, f"{module_name_short}.cu")
+
+                # write cuda sources
+                cu_source = builder.codegen("cuda")
+
+                with open(source_code_path, "w") as cu_file:
+                    cu_file.write(cu_source)
+
+                output_path = os.path.join(build_dir, output_name)
+
+                # generate PTX or CUBIN
+                with warp.ScopedTimer(
+                    f"Compile CUDA (arch={builder_options['output_arch']}, mode={mode}, block_dim={self.options['block_dim']})",
+                    active=warp.config.verbose,
+                ):
+                    warp.build.build_cuda(
+                        source_code_path,
+                        builder_options["output_arch"],
+                        output_path,
+                        config=mode,
+                        verify_fp=warp.config.verify_fp,
+                        fast_math=self.options["fast_math"],
+                        fuse_fp=self.options["fuse_fp"],
+                        lineinfo=self.options["lineinfo"],
+                        compile_time_trace=self.options["compile_time_trace"],
+                        ltoirs=builder.ltoirs.values(),
+                        fatbins=builder.fatbins.values(),
+                    )
+
+            except Exception as e:
+                if isinstance(e, FileNotFoundError):
+                    _check_and_raise_long_path_error(e)
+
+                if device:
+                    self.failed_builds.add(device.context)
+
+                # clean up build_dir used for this process regardless
+                shutil.rmtree(build_dir, ignore_errors=True)
+
+                raise (e)
+
+        # ------------------------------------------------------------
+        # build meta data
+
+        meta = builder.build_meta()
+        output_meta_path = os.path.join(build_dir, self.get_meta_name())
+
+        with open(output_meta_path, "w") as meta_file:
+            json.dump(meta, meta_file)
+
+        # -----------------------------------------------------------
+        # update cache
+
+        # try to move process outputs to cache
+        warp.build.safe_rename(build_dir, output_dir)
+
+        if os.path.exists(output_dir):
+            # final object binary path
+            binary_path = os.path.join(output_dir, output_name)
+
+            if not os.path.exists(binary_path) or self.options["strip_hash"]:
+                # copy our output file to the destination module
+                # this is necessary in case different processes
+                # have different GPU architectures / devices
+                try:
+                    os.rename(output_path, binary_path)
+                except (OSError, FileExistsError):
+                    # another process likely updated the module dir first
+                    pass
+
+            if not os.path.exists(meta_path) or self.options["strip_hash"]:
+                # copy our output file to the destination module
+                # this is necessary in case different processes
+                # have different GPU architectures / devices
+                try:
+                    os.rename(output_meta_path, meta_path)
+                except (OSError, FileExistsError):
+                    # another process likely updated the module dir first
+                    pass
+
+            try:
+                final_source_path = os.path.join(output_dir, os.path.basename(source_code_path))
+                if not os.path.exists(final_source_path) or self.options["strip_hash"]:
+                    os.rename(source_code_path, final_source_path)
+            except (OSError, FileExistsError):
+                # another process likely updated the module dir first
+                pass
+            except Exception as e:
+                # We don't need source_code_path to be copied successfully to proceed, so warn and keep running
+                warp.utils.warn(f"Exception when renaming {source_code_path}: {e}")
+
+            # clean up build_dir used for this process regardless
+            shutil.rmtree(build_dir, ignore_errors=True)
+
+    def load(
+        self,
+        device,
+        block_dim: int | None = None,
+        binary_path: os.PathLike | None = None,
+        output_arch: int | None = None,
+        meta_path: os.PathLike | None = None,
+    ) -> ModuleExec | None:
         device = runtime.get_device(device)
 
         # update module options if launching with a new block dim
@@ -2141,209 +2540,90 @@ class Module:
 
         active_block_dim = self.options["block_dim"]
 
-        # compute the hash if needed
-        if active_block_dim not in self.hashers:
-            self.hashers[active_block_dim] = ModuleHasher(self)
-
         # check if executable module is already loaded and not stale
         exec = self.execs.get((device.context, active_block_dim))
         if exec is not None:
-            if exec.module_hash == self.hashers[active_block_dim].get_module_hash():
+            if self.options["strip_hash"] or (exec.module_hash == self.get_module_hash(active_block_dim)):
                 return exec
 
         # quietly avoid repeated build attempts to reduce error spew
         if device.context in self.failed_builds:
             return None
 
-        module_name = "wp_" + self.name
-        module_hash = self.hashers[active_block_dim].get_module_hash()
+        module_hash = self.get_module_hash(active_block_dim)
 
         # use a unique module path using the module short hash
-        module_name_short = f"{module_name}_{module_hash.hex()[:7]}"
-        module_dir = os.path.join(warp.config.kernel_cache_dir, module_name_short)
+        module_name_short = self.get_module_identifier()
 
-        with warp.ScopedTimer(
-            f"Module {self.name} {module_hash.hex()[:7]} load on device '{device}'", active=not warp.config.quiet
-        ) as module_load_timer:
+        module_load_timer_name = (
+            f"Module {self.name} {module_hash.hex()[:7]} load on device '{device}'"
+            if self.options["strip_hash"] is False
+            else f"Module {self.name} load on device '{device}'"
+        )
+
+        if warp.config.verbose:
+            module_load_timer_name += f" (block_dim={active_block_dim})"
+
+        with warp.ScopedTimer(module_load_timer_name, active=not warp.config.quiet) as module_load_timer:
             # -----------------------------------------------------------
-            # determine output paths
-            if device.is_cpu:
-                output_name = f"{module_name_short}.o"
-                output_arch = None
+            # Determine binary path and build if necessary
 
-            elif device.is_cuda:
-                # determine whether to use PTX or CUBIN
-                if device.is_cubin_supported:
-                    # get user preference specified either per module or globally
-                    preferred_cuda_output = self.options.get("cuda_output") or warp.config.cuda_output
-                    if preferred_cuda_output is not None:
-                        use_ptx = preferred_cuda_output == "ptx"
-                    else:
-                        # determine automatically: older drivers may not be able to handle PTX generated using newer
-                        # CUDA Toolkits, in which case we fall back on generating CUBIN modules
-                        use_ptx = runtime.driver_version >= runtime.toolkit_version
+            if binary_path:
+                # We will never re-codegen or re-compile in this situation
+                # The expected files must already exist
+
+                if device.is_cuda and output_arch is None:
+                    raise ValueError("'output_arch' must be provided if a 'binary_path' is provided")
+
+                if meta_path is None:
+                    raise ValueError("'meta_path' must be provided if a 'binary_path' is provided")
+
+                if not os.path.exists(binary_path):
+                    module_load_timer.extra_msg = " (error)"
+                    raise FileNotFoundError(f"Binary file {binary_path} does not exist")
                 else:
-                    # CUBIN not an option, must use PTX (e.g. CUDA Toolkit too old)
-                    use_ptx = True
-
-                if use_ptx:
-                    # use the default PTX arch if the device supports it
-                    if warp.config.ptx_target_arch is not None:
-                        output_arch = min(device.arch, warp.config.ptx_target_arch)
-                    else:
-                        output_arch = min(device.arch, runtime.default_ptx_arch)
-                    output_name = f"{module_name_short}.sm{output_arch}.ptx"
-                else:
-                    output_arch = device.arch
-                    output_name = f"{module_name_short}.sm{output_arch}.cubin"
-
-            # final object binary path
-            binary_path = os.path.join(module_dir, output_name)
-
-            # -----------------------------------------------------------
-            # check cache and build if necessary
-
-            build_dir = None
-
-            # we always want to build if binary doesn't exist yet
-            # and we want to rebuild if we are not caching kernels or if we are tracking array access
-            if (
-                not os.path.exists(binary_path)
-                or not warp.config.cache_kernels
-                or warp.config.verify_autograd_array_access
-            ):
-                builder_options = {
-                    **self.options,
-                    # Some of the Tile codegen, such as cuFFTDx and cuBLASDx, requires knowledge of the target arch
-                    "output_arch": output_arch,
-                }
-                builder = ModuleBuilder(self, builder_options, hasher=self.hashers[active_block_dim])
-
-                # create a temporary (process unique) dir for build outputs before moving to the binary dir
-                build_dir = os.path.join(
-                    warp.config.kernel_cache_dir, f"{module_name}_{module_hash.hex()[:7]}_p{os.getpid()}"
-                )
-
-                # dir may exist from previous attempts / runs / archs
-                Path(build_dir).mkdir(parents=True, exist_ok=True)
-
-                module_load_timer.extra_msg = " (compiled)"  # For wp.ScopedTimer informational purposes
-
-                # build CPU
-                if device.is_cpu:
-                    # build
-                    try:
-                        source_code_path = os.path.join(build_dir, f"{module_name_short}.cpp")
-
-                        # write cpp sources
-                        cpp_source = builder.codegen("cpu")
-
-                        with open(source_code_path, "w") as cpp_file:
-                            cpp_file.write(cpp_source)
-
-                        output_path = os.path.join(build_dir, output_name)
-
-                        # build object code
-                        with warp.ScopedTimer("Compile x86", active=warp.config.verbose):
-                            warp.build.build_cpu(
-                                output_path,
-                                source_code_path,
-                                mode=self.options["mode"],
-                                fast_math=self.options["fast_math"],
-                                verify_fp=warp.config.verify_fp,
-                                fuse_fp=self.options["fuse_fp"],
-                            )
-
-                    except Exception as e:
-                        self.failed_builds.add(None)
-                        module_load_timer.extra_msg = " (error)"
-                        raise (e)
-
-                elif device.is_cuda:
-                    # build
-                    try:
-                        source_code_path = os.path.join(build_dir, f"{module_name_short}.cu")
-
-                        # write cuda sources
-                        cu_source = builder.codegen("cuda")
-
-                        with open(source_code_path, "w") as cu_file:
-                            cu_file.write(cu_source)
-
-                        output_path = os.path.join(build_dir, output_name)
-
-                        # generate PTX or CUBIN
-                        with warp.ScopedTimer("Compile CUDA", active=warp.config.verbose):
-                            warp.build.build_cuda(
-                                source_code_path,
-                                output_arch,
-                                output_path,
-                                config=self.options["mode"],
-                                verify_fp=warp.config.verify_fp,
-                                fast_math=self.options["fast_math"],
-                                fuse_fp=self.options["fuse_fp"],
-                                lineinfo=self.options["lineinfo"],
-                                compile_time_trace=self.options["compile_time_trace"],
-                                ltoirs=builder.ltoirs.values(),
-                                fatbins=builder.fatbins.values(),
-                            )
-
-                    except Exception as e:
-                        self.failed_builds.add(device.context)
-                        module_load_timer.extra_msg = " (error)"
-                        raise (e)
-
-                # ------------------------------------------------------------
-                # build meta data
-
-                meta = builder.build_meta()
-                meta_path = os.path.join(build_dir, f"{module_name_short}.meta")
-
-                with open(meta_path, "w") as meta_file:
-                    json.dump(meta, meta_file)
-
-                # -----------------------------------------------------------
-                # update cache
-
-                # try to move process outputs to cache
-                warp.build.safe_rename(build_dir, module_dir)
-
-                if os.path.exists(module_dir):
-                    if not os.path.exists(binary_path):
-                        # copy our output file to the destination module
-                        # this is necessary in case different processes
-                        # have different GPU architectures / devices
-                        try:
-                            os.rename(output_path, binary_path)
-                        except (OSError, FileExistsError):
-                            # another process likely updated the module dir first
-                            pass
-
-                    try:
-                        final_source_path = os.path.join(module_dir, os.path.basename(source_code_path))
-                        if not os.path.exists(final_source_path):
-                            os.rename(source_code_path, final_source_path)
-                    except (OSError, FileExistsError):
-                        # another process likely updated the module dir first
-                        pass
-                    except Exception as e:
-                        # We don't need source_code_path to be copied successfully to proceed, so warn and keep running
-                        warp.utils.warn(f"Exception when renaming {source_code_path}: {e}")
+                    module_load_timer.extra_msg = " (cached)"
             else:
-                module_load_timer.extra_msg = " (cached)"  # For wp.ScopedTimer informational purposes
+                # we will build if binary doesn't exist yet
+                # we will rebuild if we are not caching kernels or if we are tracking array access
+
+                output_name = self.get_compile_output_name(device)
+                output_arch = self.get_compile_arch(device)
+
+                module_dir = os.path.join(warp.config.kernel_cache_dir, module_name_short)
+                meta_path = os.path.join(module_dir, self.get_meta_name())
+                # final object binary path
+                binary_path = os.path.join(module_dir, output_name)
+
+                if (
+                    not os.path.exists(binary_path)
+                    or not warp.config.cache_kernels
+                    or warp.config.verify_autograd_array_access
+                ):
+                    try:
+                        self.compile(device, module_dir, output_name, output_arch)
+                    except Exception as e:
+                        module_load_timer.extra_msg = " (error)"
+                        raise (e)
+
+                    module_load_timer.extra_msg = " (compiled)"
+                else:
+                    module_load_timer.extra_msg = " (cached)"
 
             # -----------------------------------------------------------
             # Load CPU or CUDA binary
 
-            meta_path = os.path.join(module_dir, f"{module_name_short}.meta")
-            with open(meta_path) as meta_file:
-                meta = json.load(meta_file)
+            if os.path.exists(meta_path):
+                with open(meta_path) as meta_file:
+                    meta = json.load(meta_file)
+            else:
+                raise FileNotFoundError(f"Module metadata file {meta_path} was not found in the cache")
 
             if device.is_cpu:
                 # LLVM modules are identified using strings, so we need to ensure uniqueness
-                module_handle = f"{module_name}_{self.cpu_exec_id}"
+                module_handle = f"wp_{self.name}_{self.cpu_exec_id}"
                 self.cpu_exec_id += 1
-                runtime.llvm.load_obj(binary_path.encode("utf-8"), module_handle.encode("utf-8"))
+                runtime.llvm.wp_load_obj(binary_path.encode("utf-8"), module_handle.encode("utf-8"))
                 module_exec = ModuleExec(module_handle, module_hash, device, meta)
                 self.execs[(None, active_block_dim)] = module_exec
 
@@ -2355,12 +2635,6 @@ class Module:
                 else:
                     module_load_timer.extra_msg = " (error)"
                     raise Exception(f"Failed to load CUDA module '{self.name}'")
-
-            if build_dir:
-                import shutil
-
-                # clean up build_dir used for this process regardless
-                shutil.rmtree(build_dir, ignore_errors=True)
 
         return module_exec
 
@@ -2397,13 +2671,13 @@ class CpuDefaultAllocator:
         self.deleter = lambda ptr, size: self.free(ptr, size)
 
     def alloc(self, size_in_bytes):
-        ptr = runtime.core.alloc_host(size_in_bytes)
+        ptr = runtime.core.wp_alloc_host(size_in_bytes)
         if not ptr:
-            raise RuntimeError(f"Failed to allocate {size_in_bytes} bytes on device '{self.device}'")
+            raise RuntimeError(f"Failed to allocate {size_in_bytes} bytes on device 'cpu'")
         return ptr
 
     def free(self, ptr, size_in_bytes):
-        runtime.core.free_host(ptr)
+        runtime.core.wp_free_host(ptr)
 
 
 class CpuPinnedAllocator:
@@ -2412,13 +2686,13 @@ class CpuPinnedAllocator:
         self.deleter = lambda ptr, size: self.free(ptr, size)
 
     def alloc(self, size_in_bytes):
-        ptr = runtime.core.alloc_pinned(size_in_bytes)
+        ptr = runtime.core.wp_alloc_pinned(size_in_bytes)
         if not ptr:
             raise RuntimeError(f"Failed to allocate {size_in_bytes} bytes on device '{self.device}'")
         return ptr
 
     def free(self, ptr, size_in_bytes):
-        runtime.core.free_pinned(ptr)
+        runtime.core.wp_free_pinned(ptr)
 
 
 class CudaDefaultAllocator:
@@ -2428,7 +2702,7 @@ class CudaDefaultAllocator:
         self.deleter = lambda ptr, size: self.free(ptr, size)
 
     def alloc(self, size_in_bytes):
-        ptr = runtime.core.alloc_device_default(self.device.context, size_in_bytes)
+        ptr = runtime.core.wp_alloc_device_default(self.device.context, size_in_bytes)
         # If the allocation fails, check if graph capture is active to raise an informative error.
         # We delay the capture check to avoid overhead.
         if not ptr:
@@ -2450,7 +2724,7 @@ class CudaDefaultAllocator:
         return ptr
 
     def free(self, ptr, size_in_bytes):
-        runtime.core.free_device_default(self.device.context, ptr)
+        runtime.core.wp_free_device_default(self.device.context, ptr)
 
 
 class CudaMempoolAllocator:
@@ -2461,13 +2735,13 @@ class CudaMempoolAllocator:
         self.deleter = lambda ptr, size: self.free(ptr, size)
 
     def alloc(self, size_in_bytes):
-        ptr = runtime.core.alloc_device_async(self.device.context, size_in_bytes)
+        ptr = runtime.core.wp_alloc_device_async(self.device.context, size_in_bytes)
         if not ptr:
             raise RuntimeError(f"Failed to allocate {size_in_bytes} bytes on device '{self.device}'")
         return ptr
 
     def free(self, ptr, size_in_bytes):
-        runtime.core.free_device_async(self.device.context, ptr)
+        runtime.core.wp_free_device_async(self.device.context, ptr)
 
 
 class ContextGuard:
@@ -2476,15 +2750,15 @@ class ContextGuard:
 
     def __enter__(self):
         if self.device.is_cuda:
-            runtime.core.cuda_context_push_current(self.device.context)
+            runtime.core.wp_cuda_context_push_current(self.device.context)
         elif is_cuda_driver_initialized():
-            self.saved_context = runtime.core.cuda_context_get_current()
+            self.saved_context = runtime.core.wp_cuda_context_get_current()
 
     def __exit__(self, exc_type, exc_value, traceback):
         if self.device.is_cuda:
-            runtime.core.cuda_context_pop_current()
+            runtime.core.wp_cuda_context_pop_current()
         elif is_cuda_driver_initialized():
-            runtime.core.cuda_context_set_current(self.saved_context)
+            runtime.core.wp_cuda_context_set_current(self.saved_context)
 
 
 class Event:
@@ -2547,7 +2821,7 @@ class Event:
                     raise ValueError("The combination of 'enable_timing=True' and 'interprocess=True' is not allowed.")
                 flags |= Event.Flags.INTERPROCESS
 
-            self.cuda_event = runtime.core.cuda_event_create(device.context, flags)
+            self.cuda_event = runtime.core.wp_cuda_event_create(device.context, flags)
             if not self.cuda_event:
                 raise RuntimeError(f"Failed to create event on device {device}")
             self.owner = True
@@ -2574,7 +2848,9 @@ class Event:
             # Allocate a buffer for the data (64-element char array)
             ipc_handle_buffer = (ctypes.c_char * 64)()
 
-            warp.context.runtime.core.cuda_ipc_get_event_handle(self.device.context, self.cuda_event, ipc_handle_buffer)
+            warp.context.runtime.core.wp_cuda_ipc_get_event_handle(
+                self.device.context, self.cuda_event, ipc_handle_buffer
+            )
 
             if ipc_handle_buffer.raw == bytes(64):
                 warp.utils.warn("IPC event handle appears to be invalid. Was interprocess=True used?")
@@ -2591,7 +2867,7 @@ class Event:
         This property may not be accessed during a graph capture on any stream.
         """
 
-        result_code = runtime.core.cuda_event_query(self.cuda_event)
+        result_code = runtime.core.wp_cuda_event_query(self.cuda_event)
 
         return result_code == 0
 
@@ -2599,7 +2875,7 @@ class Event:
         if not self.owner:
             return
 
-        runtime.core.cuda_event_destroy(self.cuda_event)
+        runtime.core.wp_cuda_event_destroy(self.cuda_event)
 
 
 class Stream:
@@ -2649,12 +2925,12 @@ class Stream:
         # we pass cuda_stream through kwargs because cuda_stream=None is actually a valid value (CUDA default stream)
         if "cuda_stream" in kwargs:
             self.cuda_stream = kwargs["cuda_stream"]
-            device.runtime.core.cuda_stream_register(device.context, self.cuda_stream)
+            device.runtime.core.wp_cuda_stream_register(device.context, self.cuda_stream)
         else:
             if not isinstance(priority, int):
                 raise TypeError("Stream priority must be an integer.")
             clamped_priority = max(-1, min(priority, 0))  # Only support two priority levels
-            self.cuda_stream = device.runtime.core.cuda_stream_create(device.context, clamped_priority)
+            self.cuda_stream = device.runtime.core.wp_cuda_stream_create(device.context, clamped_priority)
 
             if not self.cuda_stream:
                 raise RuntimeError(f"Failed to create stream on device {device}")
@@ -2665,9 +2941,9 @@ class Stream:
             return
 
         if self.owner:
-            runtime.core.cuda_stream_destroy(self.device.context, self.cuda_stream)
+            runtime.core.wp_cuda_stream_destroy(self.device.context, self.cuda_stream)
         else:
-            runtime.core.cuda_stream_unregister(self.device.context, self.cuda_stream)
+            runtime.core.wp_cuda_stream_unregister(self.device.context, self.cuda_stream)
 
     @property
     def cached_event(self) -> Event:
@@ -2693,7 +2969,7 @@ class Stream:
                 f"Event from device {event.device} cannot be recorded on stream from device {self.device}"
             )
 
-        runtime.core.cuda_event_record(event.cuda_event, self.cuda_stream, event.enable_timing)
+        runtime.core.wp_cuda_event_record(event.cuda_event, self.cuda_stream, event.enable_timing)
 
         return event
 
@@ -2702,7 +2978,7 @@ class Stream:
 
         This function does not block the host thread.
         """
-        runtime.core.cuda_stream_wait_event(self.cuda_stream, event.cuda_event)
+        runtime.core.wp_cuda_stream_wait_event(self.cuda_stream, event.cuda_event)
 
     def wait_stream(self, other_stream: Stream, event: Event | None = None):
         """Records an event on `other_stream` and makes this stream wait on it.
@@ -2725,7 +3001,7 @@ class Stream:
         if event is None:
             event = other_stream.cached_event
 
-        runtime.core.cuda_stream_wait_stream(self.cuda_stream, other_stream.cuda_stream, event.cuda_event)
+        runtime.core.wp_cuda_stream_wait_stream(self.cuda_stream, other_stream.cuda_stream, event.cuda_event)
 
     @property
     def is_complete(self) -> bool:
@@ -2734,19 +3010,19 @@ class Stream:
         This property may not be accessed during a graph capture on any stream.
         """
 
-        result_code = runtime.core.cuda_stream_query(self.cuda_stream)
+        result_code = runtime.core.wp_cuda_stream_query(self.cuda_stream)
 
         return result_code == 0
 
     @property
     def is_capturing(self) -> bool:
         """A boolean indicating whether a graph capture is currently ongoing on this stream."""
-        return bool(runtime.core.cuda_stream_is_capturing(self.cuda_stream))
+        return bool(runtime.core.wp_cuda_stream_is_capturing(self.cuda_stream))
 
     @property
     def priority(self) -> int:
         """An integer representing the priority of the stream."""
-        return runtime.core.cuda_stream_get_priority(self.cuda_stream)
+        return runtime.core.wp_cuda_stream_get_priority(self.cuda_stream)
 
 
 class Device:
@@ -2815,22 +3091,22 @@ class Device:
             self.pci_bus_id = None
 
             # TODO: add more device-specific dispatch functions
-            self.memset = runtime.core.memset_host
-            self.memtile = runtime.core.memtile_host
+            self.memset = runtime.core.wp_memset_host
+            self.memtile = runtime.core.wp_memtile_host
 
             self.default_allocator = CpuDefaultAllocator(self)
             self.pinned_allocator = CpuPinnedAllocator(self)
 
-        elif ordinal >= 0 and ordinal < runtime.core.cuda_device_get_count():
+        elif ordinal >= 0 and ordinal < runtime.core.wp_cuda_device_get_count():
             # CUDA device
-            self.name = runtime.core.cuda_device_get_name(ordinal).decode()
-            self.arch = runtime.core.cuda_device_get_arch(ordinal)
-            self.sm_count = runtime.core.cuda_device_get_sm_count(ordinal)
-            self.is_uva = runtime.core.cuda_device_is_uva(ordinal) > 0
-            self.is_mempool_supported = runtime.core.cuda_device_is_mempool_supported(ordinal) > 0
+            self.name = runtime.core.wp_cuda_device_get_name(ordinal).decode()
+            self.arch = runtime.core.wp_cuda_device_get_arch(ordinal)
+            self.sm_count = runtime.core.wp_cuda_device_get_sm_count(ordinal)
+            self.is_uva = runtime.core.wp_cuda_device_is_uva(ordinal) > 0
+            self.is_mempool_supported = runtime.core.wp_cuda_device_is_mempool_supported(ordinal) > 0
             if platform.system() == "Linux":
                 # Use None when IPC support cannot be determined
-                ipc_support_api_query = runtime.core.cuda_device_is_ipc_supported(ordinal)
+                ipc_support_api_query = runtime.core.wp_cuda_device_is_ipc_supported(ordinal)
                 self.is_ipc_supported = bool(ipc_support_api_query) if ipc_support_api_query >= 0 else None
             else:
                 self.is_ipc_supported = False
@@ -2842,13 +3118,13 @@ class Device:
                 self.is_mempool_enabled = False
 
             uuid_buffer = (ctypes.c_char * 16)()
-            runtime.core.cuda_device_get_uuid(ordinal, uuid_buffer)
+            runtime.core.wp_cuda_device_get_uuid(ordinal, uuid_buffer)
             uuid_byte_str = bytes(uuid_buffer).hex()
             self.uuid = f"GPU-{uuid_byte_str[0:8]}-{uuid_byte_str[8:12]}-{uuid_byte_str[12:16]}-{uuid_byte_str[16:20]}-{uuid_byte_str[20:]}"
 
-            pci_domain_id = runtime.core.cuda_device_get_pci_domain_id(ordinal)
-            pci_bus_id = runtime.core.cuda_device_get_pci_bus_id(ordinal)
-            pci_device_id = runtime.core.cuda_device_get_pci_device_id(ordinal)
+            pci_domain_id = runtime.core.wp_cuda_device_get_pci_domain_id(ordinal)
+            pci_bus_id = runtime.core.wp_cuda_device_get_pci_bus_id(ordinal)
+            pci_device_id = runtime.core.wp_cuda_device_get_pci_device_id(ordinal)
             # This is (mis)named to correspond to the naming of cudaDeviceGetPCIBusId
             self.pci_bus_id = f"{pci_domain_id:08X}:{pci_bus_id:02X}:{pci_device_id:02X}"
 
@@ -2872,8 +3148,8 @@ class Device:
                 self._init_streams()
 
             # TODO: add more device-specific dispatch functions
-            self.memset = lambda ptr, value, size: runtime.core.memset_device(self.context, ptr, value, size)
-            self.memtile = lambda ptr, src, srcsize, reps: runtime.core.memtile_device(
+            self.memset = lambda ptr, value, size: runtime.core.wp_memset_device(self.context, ptr, value, size)
+            self.memtile = lambda ptr, src, srcsize, reps: runtime.core.wp_memtile_device(
                 self.context, ptr, src, srcsize, reps
             )
 
@@ -2932,15 +3208,15 @@ class Device:
             return self._context
         elif self.is_primary:
             # acquire primary context on demand
-            prev_context = runtime.core.cuda_context_get_current()
-            self._context = self.runtime.core.cuda_device_get_primary_context(self.ordinal)
+            prev_context = runtime.core.wp_cuda_context_get_current()
+            self._context = self.runtime.core.wp_cuda_device_get_primary_context(self.ordinal)
             if self._context is None:
-                runtime.core.cuda_context_set_current(prev_context)
+                runtime.core.wp_cuda_context_set_current(prev_context)
                 raise RuntimeError(f"Failed to acquire primary context for device {self}")
             self.runtime.context_map[self._context] = self
             # initialize streams
             self._init_streams()
-            runtime.core.cuda_context_set_current(prev_context)
+            runtime.core.wp_cuda_context_set_current(prev_context)
         return self._context
 
     @property
@@ -2984,7 +3260,7 @@ class Device:
             if stream.device != self:
                 raise RuntimeError(f"Stream from device {stream.device} cannot be used on device {self}")
 
-            self.runtime.core.cuda_context_set_stream(self.context, stream.cuda_stream, int(sync))
+            self.runtime.core.wp_cuda_context_set_stream(self.context, stream.cuda_stream, int(sync))
             self._stream = stream
         else:
             raise RuntimeError(f"Device {self} is not a CUDA device")
@@ -3002,7 +3278,7 @@ class Device:
         """
         if self.is_cuda:
             total_mem = ctypes.c_size_t()
-            self.runtime.core.cuda_device_get_memory_info(self.ordinal, None, ctypes.byref(total_mem))
+            self.runtime.core.wp_cuda_device_get_memory_info(self.ordinal, None, ctypes.byref(total_mem))
             return total_mem.value
         else:
             # TODO: cpu
@@ -3016,7 +3292,7 @@ class Device:
         """
         if self.is_cuda:
             free_mem = ctypes.c_size_t()
-            self.runtime.core.cuda_device_get_memory_info(self.ordinal, ctypes.byref(free_mem), None)
+            self.runtime.core.wp_cuda_device_get_memory_info(self.ordinal, ctypes.byref(free_mem), None)
             return free_mem.value
         else:
             # TODO: cpu
@@ -3043,7 +3319,7 @@ class Device:
 
     def make_current(self):
         if self.context is not None:
-            self.runtime.core.cuda_context_set_current(self.context)
+            self.runtime.core.wp_cuda_context_set_current(self.context)
 
     def can_access(self, other):
         # TODO: this function should be redesigned in terms of (device, resource).
@@ -3069,14 +3345,17 @@ class Graph:
         self.capture_id = capture_id
         self.module_execs: set[ModuleExec] = set()
         self.graph_exec: ctypes.c_void_p | None = None
+        self.graph: ctypes.c_void_p | None = None
 
     def __del__(self):
-        if not hasattr(self, "graph_exec") or not hasattr(self, "device") or not self.graph_exec:
+        if not hasattr(self, "graph") or not hasattr(self, "device") or not self.graph:
             return
 
         # use CUDA context guard to avoid side effects during garbage collection
         with self.device.context_guard:
-            runtime.core.cuda_graph_destroy(self.device.context, self.graph_exec)
+            runtime.core.wp_cuda_graph_destroy(self.device.context, self.graph)
+            if hasattr(self, "graph_exec") and self.graph_exec is not None:
+                runtime.core.wp_cuda_graph_exec_destroy(self.device.context, self.graph_exec)
 
     # retain executable CUDA modules used by this graph, which prevents them from being unloaded
     def retain_module_exec(self, module_exec: ModuleExec):
@@ -3087,6 +3366,14 @@ class Runtime:
     def __init__(self):
         if sys.version_info < (3, 9):
             warp.utils.warn(f"Python 3.9 or newer is recommended for running Warp, detected {sys.version_info}")
+
+        if platform.system() == "Darwin" and platform.machine() == "x86_64":
+            warp.utils.warn(
+                "Support for Warp on Intel-based macOS is deprecated and will be removed in the near future. "
+                "Apple Silicon-based Macs will continue to be supported.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
 
         bin_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "bin")
 
@@ -3110,7 +3397,7 @@ class Runtime:
         if os.path.exists(llvm_lib):
             self.llvm = self.load_dll(llvm_lib)
             # setup c-types for warp-clang.dll
-            self.llvm.lookup.restype = ctypes.c_uint64
+            self.llvm.wp_lookup.restype = ctypes.c_uint64
         else:
             self.llvm = None
 
@@ -3119,83 +3406,83 @@ class Runtime:
 
         # setup c-types for warp.dll
         try:
-            self.core.get_error_string.argtypes = []
-            self.core.get_error_string.restype = ctypes.c_char_p
-            self.core.set_error_output_enabled.argtypes = [ctypes.c_int]
-            self.core.set_error_output_enabled.restype = None
-            self.core.is_error_output_enabled.argtypes = []
-            self.core.is_error_output_enabled.restype = ctypes.c_int
+            self.core.wp_get_error_string.argtypes = []
+            self.core.wp_get_error_string.restype = ctypes.c_char_p
+            self.core.wp_set_error_output_enabled.argtypes = [ctypes.c_int]
+            self.core.wp_set_error_output_enabled.restype = None
+            self.core.wp_is_error_output_enabled.argtypes = []
+            self.core.wp_is_error_output_enabled.restype = ctypes.c_int
 
-            self.core.alloc_host.argtypes = [ctypes.c_size_t]
-            self.core.alloc_host.restype = ctypes.c_void_p
-            self.core.alloc_pinned.argtypes = [ctypes.c_size_t]
-            self.core.alloc_pinned.restype = ctypes.c_void_p
-            self.core.alloc_device.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-            self.core.alloc_device.restype = ctypes.c_void_p
-            self.core.alloc_device_default.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-            self.core.alloc_device_default.restype = ctypes.c_void_p
-            self.core.alloc_device_async.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-            self.core.alloc_device_async.restype = ctypes.c_void_p
+            self.core.wp_alloc_host.argtypes = [ctypes.c_size_t]
+            self.core.wp_alloc_host.restype = ctypes.c_void_p
+            self.core.wp_alloc_pinned.argtypes = [ctypes.c_size_t]
+            self.core.wp_alloc_pinned.restype = ctypes.c_void_p
+            self.core.wp_alloc_device.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            self.core.wp_alloc_device.restype = ctypes.c_void_p
+            self.core.wp_alloc_device_default.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            self.core.wp_alloc_device_default.restype = ctypes.c_void_p
+            self.core.wp_alloc_device_async.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            self.core.wp_alloc_device_async.restype = ctypes.c_void_p
 
-            self.core.float_to_half_bits.argtypes = [ctypes.c_float]
-            self.core.float_to_half_bits.restype = ctypes.c_uint16
-            self.core.half_bits_to_float.argtypes = [ctypes.c_uint16]
-            self.core.half_bits_to_float.restype = ctypes.c_float
+            self.core.wp_float_to_half_bits.argtypes = [ctypes.c_float]
+            self.core.wp_float_to_half_bits.restype = ctypes.c_uint16
+            self.core.wp_half_bits_to_float.argtypes = [ctypes.c_uint16]
+            self.core.wp_half_bits_to_float.restype = ctypes.c_float
 
-            self.core.free_host.argtypes = [ctypes.c_void_p]
-            self.core.free_host.restype = None
-            self.core.free_pinned.argtypes = [ctypes.c_void_p]
-            self.core.free_pinned.restype = None
-            self.core.free_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.free_device.restype = None
-            self.core.free_device_default.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.free_device_default.restype = None
-            self.core.free_device_async.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.free_device_async.restype = None
+            self.core.wp_free_host.argtypes = [ctypes.c_void_p]
+            self.core.wp_free_host.restype = None
+            self.core.wp_free_pinned.argtypes = [ctypes.c_void_p]
+            self.core.wp_free_pinned.restype = None
+            self.core.wp_free_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_free_device.restype = None
+            self.core.wp_free_device_default.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_free_device_default.restype = None
+            self.core.wp_free_device_async.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_free_device_async.restype = None
 
-            self.core.memset_host.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
-            self.core.memset_host.restype = None
-            self.core.memset_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
-            self.core.memset_device.restype = None
+            self.core.wp_memset_host.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+            self.core.wp_memset_host.restype = None
+            self.core.wp_memset_device.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+            self.core.wp_memset_device.restype = None
 
-            self.core.memtile_host.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
-            self.core.memtile_host.restype = None
-            self.core.memtile_device.argtypes = [
+            self.core.wp_memtile_host.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
+            self.core.wp_memtile_host.restype = None
+            self.core.wp_memtile_device.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_size_t,
                 ctypes.c_size_t,
             ]
-            self.core.memtile_device.restype = None
+            self.core.wp_memtile_device.restype = None
 
-            self.core.memcpy_h2h.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
-            self.core.memcpy_h2h.restype = ctypes.c_bool
-            self.core.memcpy_h2d.argtypes = [
+            self.core.wp_memcpy_h2h.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+            self.core.wp_memcpy_h2h.restype = ctypes.c_bool
+            self.core.wp_memcpy_h2d.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_size_t,
                 ctypes.c_void_p,
             ]
-            self.core.memcpy_h2d.restype = ctypes.c_bool
-            self.core.memcpy_d2h.argtypes = [
+            self.core.wp_memcpy_h2d.restype = ctypes.c_bool
+            self.core.wp_memcpy_d2h.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_size_t,
                 ctypes.c_void_p,
             ]
-            self.core.memcpy_d2h.restype = ctypes.c_bool
-            self.core.memcpy_d2d.argtypes = [
+            self.core.wp_memcpy_d2h.restype = ctypes.c_bool
+            self.core.wp_memcpy_d2d.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_size_t,
                 ctypes.c_void_p,
             ]
-            self.core.memcpy_d2d.restype = ctypes.c_bool
-            self.core.memcpy_p2p.argtypes = [
+            self.core.wp_memcpy_d2d.restype = ctypes.c_bool
+            self.core.wp_memcpy_p2p.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
@@ -3203,17 +3490,17 @@ class Runtime:
                 ctypes.c_size_t,
                 ctypes.c_void_p,
             ]
-            self.core.memcpy_p2p.restype = ctypes.c_bool
+            self.core.wp_memcpy_p2p.restype = ctypes.c_bool
 
-            self.core.array_copy_host.argtypes = [
+            self.core.wp_array_copy_host.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
             ]
-            self.core.array_copy_host.restype = ctypes.c_bool
-            self.core.array_copy_device.argtypes = [
+            self.core.wp_array_copy_host.restype = ctypes.c_bool
+            self.core.wp_array_copy_device.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
@@ -3221,100 +3508,115 @@ class Runtime:
                 ctypes.c_int,
                 ctypes.c_int,
             ]
-            self.core.array_copy_device.restype = ctypes.c_bool
+            self.core.wp_array_copy_device.restype = ctypes.c_bool
 
-            self.core.array_fill_host.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
-            self.core.array_fill_host.restype = None
-            self.core.array_fill_device.argtypes = [
+            self.core.wp_array_fill_host.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+            self.core.wp_array_fill_host.restype = None
+            self.core.wp_array_fill_device.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_int,
                 ctypes.c_void_p,
                 ctypes.c_int,
             ]
-            self.core.array_fill_device.restype = None
+            self.core.wp_array_fill_device.restype = None
 
-            self.core.array_sum_double_host.argtypes = [
+            self.core.wp_array_sum_double_host.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_uint64,
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
             ]
-            self.core.array_sum_float_host.argtypes = [
+            self.core.wp_array_sum_float_host.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_uint64,
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
             ]
-            self.core.array_sum_double_device.argtypes = [
+            self.core.wp_array_sum_double_device.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_uint64,
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
             ]
-            self.core.array_sum_float_device.argtypes = [
+            self.core.wp_array_sum_float_device.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_uint64,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-            ]
-
-            self.core.array_inner_double_host.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-            ]
-            self.core.array_inner_float_host.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-            ]
-            self.core.array_inner_double_device.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_int,
-            ]
-            self.core.array_inner_float_device.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
                 ctypes.c_int,
             ]
 
-            self.core.array_scan_int_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int, ctypes.c_bool]
-            self.core.array_scan_float_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int, ctypes.c_bool]
-            self.core.array_scan_int_device.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int, ctypes.c_bool]
-            self.core.array_scan_float_device.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int, ctypes.c_bool]
+            self.core.wp_array_inner_double_host.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            self.core.wp_array_inner_float_host.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            self.core.wp_array_inner_double_device.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            self.core.wp_array_inner_float_device.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
 
-            self.core.radix_sort_pairs_int_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
-            self.core.radix_sort_pairs_int_device.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+            self.core.wp_array_scan_int_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int, ctypes.c_bool]
+            self.core.wp_array_scan_float_host.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_bool,
+            ]
+            self.core.wp_array_scan_int_device.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_bool,
+            ]
+            self.core.wp_array_scan_float_device.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_bool,
+            ]
 
-            self.core.radix_sort_pairs_float_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
-            self.core.radix_sort_pairs_float_device.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+            self.core.wp_radix_sort_pairs_int_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+            self.core.wp_radix_sort_pairs_int_device.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
 
-            self.core.radix_sort_pairs_int64_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
-            self.core.radix_sort_pairs_int64_device.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+            self.core.wp_radix_sort_pairs_float_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+            self.core.wp_radix_sort_pairs_float_device.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
 
-            self.core.segmented_sort_pairs_int_host.argtypes = [
+            self.core.wp_radix_sort_pairs_int64_host.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+            self.core.wp_radix_sort_pairs_int64_device.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int]
+
+            self.core.wp_segmented_sort_pairs_int_host.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_uint64,
                 ctypes.c_int,
@@ -3322,24 +3624,7 @@ class Runtime:
                 ctypes.c_uint64,
                 ctypes.c_int,
             ]
-            self.core.segmented_sort_pairs_int_device.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int,
-            ]
-
-            self.core.segmented_sort_pairs_float_host.argtypes = [
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int,
-                ctypes.c_uint64,
-                ctypes.c_uint64,
-                ctypes.c_int,
-            ]
-            self.core.segmented_sort_pairs_float_device.argtypes = [
+            self.core.wp_segmented_sort_pairs_int_device.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_uint64,
                 ctypes.c_int,
@@ -3348,14 +3633,31 @@ class Runtime:
                 ctypes.c_int,
             ]
 
-            self.core.runlength_encode_int_host.argtypes = [
+            self.core.wp_segmented_sort_pairs_float_host.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+            ]
+            self.core.wp_segmented_sort_pairs_float_device.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_uint64,
+                ctypes.c_int,
+            ]
+
+            self.core.wp_runlength_encode_int_host.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_uint64,
                 ctypes.c_uint64,
                 ctypes.c_uint64,
                 ctypes.c_int,
             ]
-            self.core.runlength_encode_int_device.argtypes = [
+            self.core.wp_runlength_encode_int_device.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_uint64,
                 ctypes.c_uint64,
@@ -3363,11 +3665,11 @@ class Runtime:
                 ctypes.c_int,
             ]
 
-            self.core.bvh_create_host.restype = ctypes.c_uint64
-            self.core.bvh_create_host.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+            self.core.wp_bvh_create_host.restype = ctypes.c_uint64
+            self.core.wp_bvh_create_host.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
 
-            self.core.bvh_create_device.restype = ctypes.c_uint64
-            self.core.bvh_create_device.argtypes = [
+            self.core.wp_bvh_create_device.restype = ctypes.c_uint64
+            self.core.wp_bvh_create_device.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
@@ -3375,14 +3677,14 @@ class Runtime:
                 ctypes.c_int,
             ]
 
-            self.core.bvh_destroy_host.argtypes = [ctypes.c_uint64]
-            self.core.bvh_destroy_device.argtypes = [ctypes.c_uint64]
+            self.core.wp_bvh_destroy_host.argtypes = [ctypes.c_uint64]
+            self.core.wp_bvh_destroy_device.argtypes = [ctypes.c_uint64]
 
-            self.core.bvh_refit_host.argtypes = [ctypes.c_uint64]
-            self.core.bvh_refit_device.argtypes = [ctypes.c_uint64]
+            self.core.wp_bvh_refit_host.argtypes = [ctypes.c_uint64]
+            self.core.wp_bvh_refit_device.argtypes = [ctypes.c_uint64]
 
-            self.core.mesh_create_host.restype = ctypes.c_uint64
-            self.core.mesh_create_host.argtypes = [
+            self.core.wp_mesh_create_host.restype = ctypes.c_uint64
+            self.core.wp_mesh_create_host.argtypes = [
                 warp.types.array_t,
                 warp.types.array_t,
                 warp.types.array_t,
@@ -3392,8 +3694,8 @@ class Runtime:
                 ctypes.c_int,
             ]
 
-            self.core.mesh_create_device.restype = ctypes.c_uint64
-            self.core.mesh_create_device.argtypes = [
+            self.core.wp_mesh_create_device.restype = ctypes.c_uint64
+            self.core.wp_mesh_create_device.argtypes = [
                 ctypes.c_void_p,
                 warp.types.array_t,
                 warp.types.array_t,
@@ -3404,61 +3706,61 @@ class Runtime:
                 ctypes.c_int,
             ]
 
-            self.core.mesh_destroy_host.argtypes = [ctypes.c_uint64]
-            self.core.mesh_destroy_device.argtypes = [ctypes.c_uint64]
+            self.core.wp_mesh_destroy_host.argtypes = [ctypes.c_uint64]
+            self.core.wp_mesh_destroy_device.argtypes = [ctypes.c_uint64]
 
-            self.core.mesh_refit_host.argtypes = [ctypes.c_uint64]
-            self.core.mesh_refit_device.argtypes = [ctypes.c_uint64]
+            self.core.wp_mesh_refit_host.argtypes = [ctypes.c_uint64]
+            self.core.wp_mesh_refit_device.argtypes = [ctypes.c_uint64]
 
-            self.core.mesh_set_points_host.argtypes = [ctypes.c_uint64, warp.types.array_t]
-            self.core.mesh_set_points_device.argtypes = [ctypes.c_uint64, warp.types.array_t]
+            self.core.wp_mesh_set_points_host.argtypes = [ctypes.c_uint64, warp.types.array_t]
+            self.core.wp_mesh_set_points_device.argtypes = [ctypes.c_uint64, warp.types.array_t]
 
-            self.core.mesh_set_velocities_host.argtypes = [ctypes.c_uint64, warp.types.array_t]
-            self.core.mesh_set_velocities_device.argtypes = [ctypes.c_uint64, warp.types.array_t]
+            self.core.wp_mesh_set_velocities_host.argtypes = [ctypes.c_uint64, warp.types.array_t]
+            self.core.wp_mesh_set_velocities_device.argtypes = [ctypes.c_uint64, warp.types.array_t]
 
-            self.core.hash_grid_create_host.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
-            self.core.hash_grid_create_host.restype = ctypes.c_uint64
-            self.core.hash_grid_destroy_host.argtypes = [ctypes.c_uint64]
-            self.core.hash_grid_update_host.argtypes = [ctypes.c_uint64, ctypes.c_float, ctypes.c_void_p]
-            self.core.hash_grid_reserve_host.argtypes = [ctypes.c_uint64, ctypes.c_int]
+            self.core.wp_hash_grid_create_host.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            self.core.wp_hash_grid_create_host.restype = ctypes.c_uint64
+            self.core.wp_hash_grid_destroy_host.argtypes = [ctypes.c_uint64]
+            self.core.wp_hash_grid_update_host.argtypes = [ctypes.c_uint64, ctypes.c_float, ctypes.c_void_p]
+            self.core.wp_hash_grid_reserve_host.argtypes = [ctypes.c_uint64, ctypes.c_int]
 
-            self.core.hash_grid_create_device.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
-            self.core.hash_grid_create_device.restype = ctypes.c_uint64
-            self.core.hash_grid_destroy_device.argtypes = [ctypes.c_uint64]
-            self.core.hash_grid_update_device.argtypes = [ctypes.c_uint64, ctypes.c_float, ctypes.c_void_p]
-            self.core.hash_grid_reserve_device.argtypes = [ctypes.c_uint64, ctypes.c_int]
+            self.core.wp_hash_grid_create_device.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            self.core.wp_hash_grid_create_device.restype = ctypes.c_uint64
+            self.core.wp_hash_grid_destroy_device.argtypes = [ctypes.c_uint64]
+            self.core.wp_hash_grid_update_device.argtypes = [ctypes.c_uint64, ctypes.c_float, ctypes.c_void_p]
+            self.core.wp_hash_grid_reserve_device.argtypes = [ctypes.c_uint64, ctypes.c_int]
 
-            self.core.volume_create_host.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_bool, ctypes.c_bool]
-            self.core.volume_create_host.restype = ctypes.c_uint64
-            self.core.volume_get_tiles_host.argtypes = [
+            self.core.wp_volume_create_host.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_bool, ctypes.c_bool]
+            self.core.wp_volume_create_host.restype = ctypes.c_uint64
+            self.core.wp_volume_get_tiles_host.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_void_p,
             ]
-            self.core.volume_get_voxels_host.argtypes = [
+            self.core.wp_volume_get_voxels_host.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_void_p,
             ]
-            self.core.volume_destroy_host.argtypes = [ctypes.c_uint64]
+            self.core.wp_volume_destroy_host.argtypes = [ctypes.c_uint64]
 
-            self.core.volume_create_device.argtypes = [
+            self.core.wp_volume_create_device.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_uint64,
                 ctypes.c_bool,
                 ctypes.c_bool,
             ]
-            self.core.volume_create_device.restype = ctypes.c_uint64
-            self.core.volume_get_tiles_device.argtypes = [
+            self.core.wp_volume_create_device.restype = ctypes.c_uint64
+            self.core.wp_volume_get_tiles_device.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_void_p,
             ]
-            self.core.volume_get_voxels_device.argtypes = [
+            self.core.wp_volume_get_voxels_device.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_void_p,
             ]
-            self.core.volume_destroy_device.argtypes = [ctypes.c_uint64]
+            self.core.wp_volume_destroy_device.argtypes = [ctypes.c_uint64]
 
-            self.core.volume_from_tiles_device.argtypes = [
+            self.core.wp_volume_from_tiles_device.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_int,
@@ -3469,8 +3771,8 @@ class Runtime:
                 ctypes.c_uint32,
                 ctypes.c_char_p,
             ]
-            self.core.volume_from_tiles_device.restype = ctypes.c_uint64
-            self.core.volume_index_from_tiles_device.argtypes = [
+            self.core.wp_volume_from_tiles_device.restype = ctypes.c_uint64
+            self.core.wp_volume_index_from_tiles_device.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_int,
@@ -3478,8 +3780,8 @@ class Runtime:
                 ctypes.c_float * 3,
                 ctypes.c_bool,
             ]
-            self.core.volume_index_from_tiles_device.restype = ctypes.c_uint64
-            self.core.volume_from_active_voxels_device.argtypes = [
+            self.core.wp_volume_index_from_tiles_device.restype = ctypes.c_uint64
+            self.core.wp_volume_from_active_voxels_device.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_int,
@@ -3487,25 +3789,25 @@ class Runtime:
                 ctypes.c_float * 3,
                 ctypes.c_bool,
             ]
-            self.core.volume_from_active_voxels_device.restype = ctypes.c_uint64
+            self.core.wp_volume_from_active_voxels_device.restype = ctypes.c_uint64
 
-            self.core.volume_get_buffer_info.argtypes = [
+            self.core.wp_volume_get_buffer_info.argtypes = [
                 ctypes.c_uint64,
                 ctypes.POINTER(ctypes.c_void_p),
                 ctypes.POINTER(ctypes.c_uint64),
             ]
-            self.core.volume_get_voxel_size.argtypes = [
+            self.core.wp_volume_get_voxel_size.argtypes = [
                 ctypes.c_uint64,
                 ctypes.POINTER(ctypes.c_float),
                 ctypes.POINTER(ctypes.c_float),
                 ctypes.POINTER(ctypes.c_float),
             ]
-            self.core.volume_get_tile_and_voxel_count.argtypes = [
+            self.core.wp_volume_get_tile_and_voxel_count.argtypes = [
                 ctypes.c_uint64,
                 ctypes.POINTER(ctypes.c_uint32),
                 ctypes.POINTER(ctypes.c_uint64),
             ]
-            self.core.volume_get_grid_info.argtypes = [
+            self.core.wp_volume_get_grid_info.argtypes = [
                 ctypes.c_uint64,
                 ctypes.POINTER(ctypes.c_uint64),
                 ctypes.POINTER(ctypes.c_uint32),
@@ -3514,12 +3816,12 @@ class Runtime:
                 ctypes.c_float * 9,
                 ctypes.c_char * 16,
             ]
-            self.core.volume_get_grid_info.restype = ctypes.c_char_p
-            self.core.volume_get_blind_data_count.argtypes = [
+            self.core.wp_volume_get_grid_info.restype = ctypes.c_char_p
+            self.core.wp_volume_get_blind_data_count.argtypes = [
                 ctypes.c_uint64,
             ]
-            self.core.volume_get_blind_data_count.restype = ctypes.c_uint64
-            self.core.volume_get_blind_data_info.argtypes = [
+            self.core.wp_volume_get_blind_data_count.restype = ctypes.c_uint64
+            self.core.wp_volume_get_blind_data_info.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_uint32,
                 ctypes.POINTER(ctypes.c_void_p),
@@ -3527,206 +3829,267 @@ class Runtime:
                 ctypes.POINTER(ctypes.c_uint32),
                 ctypes.c_char * 16,
             ]
-            self.core.volume_get_blind_data_info.restype = ctypes.c_char_p
+            self.core.wp_volume_get_blind_data_info.restype = ctypes.c_char_p
 
             bsr_matrix_from_triplets_argtypes = [
-                ctypes.c_int,  # rows_per_bock
-                ctypes.c_int,  # cols_per_blocks
+                ctypes.c_int,  # block_size
+                ctypes.c_int,  # scalar size in bytes
                 ctypes.c_int,  # row_count
-                ctypes.c_int,  # tpl_nnz
+                ctypes.c_int,  # col_count
+                ctypes.c_int,  # nnz_upper_bound
+                ctypes.POINTER(ctypes.c_int),  # tpl_nnz
                 ctypes.POINTER(ctypes.c_int),  # tpl_rows
                 ctypes.POINTER(ctypes.c_int),  # tpl_cols
                 ctypes.c_void_p,  # tpl_values
-                ctypes.c_bool,  # prune_numerical_zeros
+                ctypes.c_uint64,  # zero_value_mask
                 ctypes.c_bool,  # masked
                 ctypes.POINTER(ctypes.c_int),  # bsr_offsets
                 ctypes.POINTER(ctypes.c_int),  # bsr_columns
-                ctypes.c_void_p,  # bsr_values
+                ctypes.POINTER(ctypes.c_int),  # prefix sum of block count to sum for each bsr block
+                ctypes.POINTER(ctypes.c_int),  # indices to ptriplet blocks to sum for each bsr block
                 ctypes.POINTER(ctypes.c_int),  # bsr_nnz
                 ctypes.c_void_p,  # bsr_nnz_event
             ]
 
-            self.core.bsr_matrix_from_triplets_float_host.argtypes = bsr_matrix_from_triplets_argtypes
-            self.core.bsr_matrix_from_triplets_double_host.argtypes = bsr_matrix_from_triplets_argtypes
-            self.core.bsr_matrix_from_triplets_float_device.argtypes = bsr_matrix_from_triplets_argtypes
-            self.core.bsr_matrix_from_triplets_double_device.argtypes = bsr_matrix_from_triplets_argtypes
+            self.core.wp_bsr_matrix_from_triplets_host.argtypes = bsr_matrix_from_triplets_argtypes
+            self.core.wp_bsr_matrix_from_triplets_device.argtypes = bsr_matrix_from_triplets_argtypes
 
             bsr_transpose_argtypes = [
-                ctypes.c_int,  # rows_per_bock
-                ctypes.c_int,  # cols_per_blocks
                 ctypes.c_int,  # row_count
                 ctypes.c_int,  # col count
                 ctypes.c_int,  # nnz
                 ctypes.POINTER(ctypes.c_int),  # transposed_bsr_offsets
                 ctypes.POINTER(ctypes.c_int),  # transposed_bsr_columns
-                ctypes.c_void_p,  # bsr_values
                 ctypes.POINTER(ctypes.c_int),  # transposed_bsr_offsets
                 ctypes.POINTER(ctypes.c_int),  # transposed_bsr_columns
-                ctypes.c_void_p,  # transposed_bsr_values
+                ctypes.POINTER(ctypes.c_int),  # src to dest block map
             ]
-            self.core.bsr_transpose_float_host.argtypes = bsr_transpose_argtypes
-            self.core.bsr_transpose_double_host.argtypes = bsr_transpose_argtypes
-            self.core.bsr_transpose_float_device.argtypes = bsr_transpose_argtypes
-            self.core.bsr_transpose_double_device.argtypes = bsr_transpose_argtypes
+            self.core.wp_bsr_transpose_host.argtypes = bsr_transpose_argtypes
+            self.core.wp_bsr_transpose_device.argtypes = bsr_transpose_argtypes
 
-            self.core.is_cuda_enabled.argtypes = None
-            self.core.is_cuda_enabled.restype = ctypes.c_int
-            self.core.is_cuda_compatibility_enabled.argtypes = None
-            self.core.is_cuda_compatibility_enabled.restype = ctypes.c_int
-            self.core.is_mathdx_enabled.argtypes = None
-            self.core.is_mathdx_enabled.restype = ctypes.c_int
+            self.core.wp_is_cuda_enabled.argtypes = None
+            self.core.wp_is_cuda_enabled.restype = ctypes.c_int
+            self.core.wp_is_cuda_compatibility_enabled.argtypes = None
+            self.core.wp_is_cuda_compatibility_enabled.restype = ctypes.c_int
+            self.core.wp_is_mathdx_enabled.argtypes = None
+            self.core.wp_is_mathdx_enabled.restype = ctypes.c_int
 
-            self.core.cuda_driver_version.argtypes = None
-            self.core.cuda_driver_version.restype = ctypes.c_int
-            self.core.cuda_toolkit_version.argtypes = None
-            self.core.cuda_toolkit_version.restype = ctypes.c_int
-            self.core.cuda_driver_is_initialized.argtypes = None
-            self.core.cuda_driver_is_initialized.restype = ctypes.c_bool
+            self.core.wp_cuda_driver_version.argtypes = None
+            self.core.wp_cuda_driver_version.restype = ctypes.c_int
+            self.core.wp_cuda_toolkit_version.argtypes = None
+            self.core.wp_cuda_toolkit_version.restype = ctypes.c_int
+            self.core.wp_cuda_driver_is_initialized.argtypes = None
+            self.core.wp_cuda_driver_is_initialized.restype = ctypes.c_bool
 
-            self.core.nvrtc_supported_arch_count.argtypes = None
-            self.core.nvrtc_supported_arch_count.restype = ctypes.c_int
-            self.core.nvrtc_supported_archs.argtypes = [ctypes.POINTER(ctypes.c_int)]
-            self.core.nvrtc_supported_archs.restype = None
+            self.core.wp_nvrtc_supported_arch_count.argtypes = None
+            self.core.wp_nvrtc_supported_arch_count.restype = ctypes.c_int
+            self.core.wp_nvrtc_supported_archs.argtypes = [ctypes.POINTER(ctypes.c_int)]
+            self.core.wp_nvrtc_supported_archs.restype = None
 
-            self.core.cuda_device_get_count.argtypes = None
-            self.core.cuda_device_get_count.restype = ctypes.c_int
-            self.core.cuda_device_get_primary_context.argtypes = [ctypes.c_int]
-            self.core.cuda_device_get_primary_context.restype = ctypes.c_void_p
-            self.core.cuda_device_get_name.argtypes = [ctypes.c_int]
-            self.core.cuda_device_get_name.restype = ctypes.c_char_p
-            self.core.cuda_device_get_arch.argtypes = [ctypes.c_int]
-            self.core.cuda_device_get_arch.restype = ctypes.c_int
-            self.core.cuda_device_get_sm_count.argtypes = [ctypes.c_int]
-            self.core.cuda_device_get_sm_count.restype = ctypes.c_int
-            self.core.cuda_device_is_uva.argtypes = [ctypes.c_int]
-            self.core.cuda_device_is_uva.restype = ctypes.c_int
-            self.core.cuda_device_is_mempool_supported.argtypes = [ctypes.c_int]
-            self.core.cuda_device_is_mempool_supported.restype = ctypes.c_int
-            self.core.cuda_device_is_ipc_supported.argtypes = [ctypes.c_int]
-            self.core.cuda_device_is_ipc_supported.restype = ctypes.c_int
-            self.core.cuda_device_set_mempool_release_threshold.argtypes = [ctypes.c_int, ctypes.c_uint64]
-            self.core.cuda_device_set_mempool_release_threshold.restype = ctypes.c_int
-            self.core.cuda_device_get_mempool_release_threshold.argtypes = [ctypes.c_int]
-            self.core.cuda_device_get_mempool_release_threshold.restype = ctypes.c_uint64
-            self.core.cuda_device_get_mempool_used_mem_current.argtypes = [ctypes.c_int]
-            self.core.cuda_device_get_mempool_used_mem_current.restype = ctypes.c_uint64
-            self.core.cuda_device_get_mempool_used_mem_high.argtypes = [ctypes.c_int]
-            self.core.cuda_device_get_mempool_used_mem_high.restype = ctypes.c_uint64
-            self.core.cuda_device_get_memory_info.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_device_get_memory_info.restype = None
-            self.core.cuda_device_get_uuid.argtypes = [ctypes.c_int, ctypes.c_char * 16]
-            self.core.cuda_device_get_uuid.restype = None
-            self.core.cuda_device_get_pci_domain_id.argtypes = [ctypes.c_int]
-            self.core.cuda_device_get_pci_domain_id.restype = ctypes.c_int
-            self.core.cuda_device_get_pci_bus_id.argtypes = [ctypes.c_int]
-            self.core.cuda_device_get_pci_bus_id.restype = ctypes.c_int
-            self.core.cuda_device_get_pci_device_id.argtypes = [ctypes.c_int]
-            self.core.cuda_device_get_pci_device_id.restype = ctypes.c_int
+            self.core.wp_cuda_device_get_count.argtypes = None
+            self.core.wp_cuda_device_get_count.restype = ctypes.c_int
+            self.core.wp_cuda_device_get_primary_context.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_get_primary_context.restype = ctypes.c_void_p
+            self.core.wp_cuda_device_get_name.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_get_name.restype = ctypes.c_char_p
+            self.core.wp_cuda_device_get_arch.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_get_arch.restype = ctypes.c_int
+            self.core.wp_cuda_device_get_sm_count.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_get_sm_count.restype = ctypes.c_int
+            self.core.wp_cuda_device_is_uva.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_is_uva.restype = ctypes.c_int
+            self.core.wp_cuda_device_is_mempool_supported.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_is_mempool_supported.restype = ctypes.c_int
+            self.core.wp_cuda_device_is_ipc_supported.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_is_ipc_supported.restype = ctypes.c_int
+            self.core.wp_cuda_device_set_mempool_release_threshold.argtypes = [ctypes.c_int, ctypes.c_uint64]
+            self.core.wp_cuda_device_set_mempool_release_threshold.restype = ctypes.c_int
+            self.core.wp_cuda_device_get_mempool_release_threshold.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_get_mempool_release_threshold.restype = ctypes.c_uint64
+            self.core.wp_cuda_device_get_mempool_used_mem_current.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_get_mempool_used_mem_current.restype = ctypes.c_uint64
+            self.core.wp_cuda_device_get_mempool_used_mem_high.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_get_mempool_used_mem_high.restype = ctypes.c_uint64
+            self.core.wp_cuda_device_get_memory_info.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_device_get_memory_info.restype = None
+            self.core.wp_cuda_device_get_uuid.argtypes = [ctypes.c_int, ctypes.c_char * 16]
+            self.core.wp_cuda_device_get_uuid.restype = None
+            self.core.wp_cuda_device_get_pci_domain_id.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_get_pci_domain_id.restype = ctypes.c_int
+            self.core.wp_cuda_device_get_pci_bus_id.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_get_pci_bus_id.restype = ctypes.c_int
+            self.core.wp_cuda_device_get_pci_device_id.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_device_get_pci_device_id.restype = ctypes.c_int
 
-            self.core.cuda_context_get_current.argtypes = None
-            self.core.cuda_context_get_current.restype = ctypes.c_void_p
-            self.core.cuda_context_set_current.argtypes = [ctypes.c_void_p]
-            self.core.cuda_context_set_current.restype = None
-            self.core.cuda_context_push_current.argtypes = [ctypes.c_void_p]
-            self.core.cuda_context_push_current.restype = None
-            self.core.cuda_context_pop_current.argtypes = None
-            self.core.cuda_context_pop_current.restype = None
-            self.core.cuda_context_create.argtypes = [ctypes.c_int]
-            self.core.cuda_context_create.restype = ctypes.c_void_p
-            self.core.cuda_context_destroy.argtypes = [ctypes.c_void_p]
-            self.core.cuda_context_destroy.restype = None
-            self.core.cuda_context_synchronize.argtypes = [ctypes.c_void_p]
-            self.core.cuda_context_synchronize.restype = None
-            self.core.cuda_context_check.argtypes = [ctypes.c_void_p]
-            self.core.cuda_context_check.restype = ctypes.c_uint64
+            self.core.wp_cuda_context_get_current.argtypes = None
+            self.core.wp_cuda_context_get_current.restype = ctypes.c_void_p
+            self.core.wp_cuda_context_set_current.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_context_set_current.restype = None
+            self.core.wp_cuda_context_push_current.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_context_push_current.restype = None
+            self.core.wp_cuda_context_pop_current.argtypes = None
+            self.core.wp_cuda_context_pop_current.restype = None
+            self.core.wp_cuda_context_create.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_context_create.restype = ctypes.c_void_p
+            self.core.wp_cuda_context_destroy.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_context_destroy.restype = None
+            self.core.wp_cuda_context_synchronize.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_context_synchronize.restype = None
+            self.core.wp_cuda_context_check.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_context_check.restype = ctypes.c_uint64
 
-            self.core.cuda_context_get_device_ordinal.argtypes = [ctypes.c_void_p]
-            self.core.cuda_context_get_device_ordinal.restype = ctypes.c_int
-            self.core.cuda_context_is_primary.argtypes = [ctypes.c_void_p]
-            self.core.cuda_context_is_primary.restype = ctypes.c_int
-            self.core.cuda_context_get_stream.argtypes = [ctypes.c_void_p]
-            self.core.cuda_context_get_stream.restype = ctypes.c_void_p
-            self.core.cuda_context_set_stream.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
-            self.core.cuda_context_set_stream.restype = None
+            self.core.wp_cuda_context_get_device_ordinal.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_context_get_device_ordinal.restype = ctypes.c_int
+            self.core.wp_cuda_context_is_primary.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_context_is_primary.restype = ctypes.c_int
+            self.core.wp_cuda_context_get_stream.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_context_get_stream.restype = ctypes.c_void_p
+            self.core.wp_cuda_context_set_stream.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+            self.core.wp_cuda_context_set_stream.restype = None
 
             # peer access
-            self.core.cuda_is_peer_access_supported.argtypes = [ctypes.c_int, ctypes.c_int]
-            self.core.cuda_is_peer_access_supported.restype = ctypes.c_int
-            self.core.cuda_is_peer_access_enabled.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_is_peer_access_enabled.restype = ctypes.c_int
-            self.core.cuda_set_peer_access_enabled.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
-            self.core.cuda_set_peer_access_enabled.restype = ctypes.c_int
-            self.core.cuda_is_mempool_access_enabled.argtypes = [ctypes.c_int, ctypes.c_int]
-            self.core.cuda_is_mempool_access_enabled.restype = ctypes.c_int
-            self.core.cuda_set_mempool_access_enabled.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
-            self.core.cuda_set_mempool_access_enabled.restype = ctypes.c_int
+            self.core.wp_cuda_is_peer_access_supported.argtypes = [ctypes.c_int, ctypes.c_int]
+            self.core.wp_cuda_is_peer_access_supported.restype = ctypes.c_int
+            self.core.wp_cuda_is_peer_access_enabled.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_is_peer_access_enabled.restype = ctypes.c_int
+            self.core.wp_cuda_set_peer_access_enabled.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+            self.core.wp_cuda_set_peer_access_enabled.restype = ctypes.c_int
+            self.core.wp_cuda_is_mempool_access_enabled.argtypes = [ctypes.c_int, ctypes.c_int]
+            self.core.wp_cuda_is_mempool_access_enabled.restype = ctypes.c_int
+            self.core.wp_cuda_set_mempool_access_enabled.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            self.core.wp_cuda_set_mempool_access_enabled.restype = ctypes.c_int
 
             # inter-process communication
-            self.core.cuda_ipc_get_mem_handle.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char)]
-            self.core.cuda_ipc_get_mem_handle.restype = None
-            self.core.cuda_ipc_open_mem_handle.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char)]
-            self.core.cuda_ipc_open_mem_handle.restype = ctypes.c_void_p
-            self.core.cuda_ipc_close_mem_handle.argtypes = [ctypes.c_void_p]
-            self.core.cuda_ipc_close_mem_handle.restype = None
-            self.core.cuda_ipc_get_event_handle.argtypes = [
+            self.core.wp_cuda_ipc_get_mem_handle.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char)]
+            self.core.wp_cuda_ipc_get_mem_handle.restype = None
+            self.core.wp_cuda_ipc_open_mem_handle.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char)]
+            self.core.wp_cuda_ipc_open_mem_handle.restype = ctypes.c_void_p
+            self.core.wp_cuda_ipc_close_mem_handle.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_ipc_close_mem_handle.restype = None
+            self.core.wp_cuda_ipc_get_event_handle.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.POINTER(ctypes.c_char),
             ]
-            self.core.cuda_ipc_get_event_handle.restype = None
-            self.core.cuda_ipc_open_event_handle.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char)]
-            self.core.cuda_ipc_open_event_handle.restype = ctypes.c_void_p
+            self.core.wp_cuda_ipc_get_event_handle.restype = None
+            self.core.wp_cuda_ipc_open_event_handle.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char)]
+            self.core.wp_cuda_ipc_open_event_handle.restype = ctypes.c_void_p
 
-            self.core.cuda_stream_create.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            self.core.cuda_stream_create.restype = ctypes.c_void_p
-            self.core.cuda_stream_destroy.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_stream_destroy.restype = None
-            self.core.cuda_stream_query.argtypes = [ctypes.c_void_p]
-            self.core.cuda_stream_query.restype = ctypes.c_int
-            self.core.cuda_stream_register.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_stream_register.restype = None
-            self.core.cuda_stream_unregister.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_stream_unregister.restype = None
-            self.core.cuda_stream_synchronize.argtypes = [ctypes.c_void_p]
-            self.core.cuda_stream_synchronize.restype = None
-            self.core.cuda_stream_wait_event.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_stream_wait_event.restype = None
-            self.core.cuda_stream_wait_stream.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_stream_wait_stream.restype = None
-            self.core.cuda_stream_is_capturing.argtypes = [ctypes.c_void_p]
-            self.core.cuda_stream_is_capturing.restype = ctypes.c_int
-            self.core.cuda_stream_get_capture_id.argtypes = [ctypes.c_void_p]
-            self.core.cuda_stream_get_capture_id.restype = ctypes.c_uint64
-            self.core.cuda_stream_get_priority.argtypes = [ctypes.c_void_p]
-            self.core.cuda_stream_get_priority.restype = ctypes.c_int
+            self.core.wp_cuda_stream_create.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            self.core.wp_cuda_stream_create.restype = ctypes.c_void_p
+            self.core.wp_cuda_stream_destroy.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_stream_destroy.restype = None
+            self.core.wp_cuda_stream_query.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_stream_query.restype = ctypes.c_int
+            self.core.wp_cuda_stream_register.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_stream_register.restype = None
+            self.core.wp_cuda_stream_unregister.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_stream_unregister.restype = None
+            self.core.wp_cuda_stream_synchronize.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_stream_synchronize.restype = None
+            self.core.wp_cuda_stream_wait_event.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_stream_wait_event.restype = None
+            self.core.wp_cuda_stream_wait_stream.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_stream_wait_stream.restype = None
+            self.core.wp_cuda_stream_is_capturing.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_stream_is_capturing.restype = ctypes.c_int
+            self.core.wp_cuda_stream_get_capture_id.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_stream_get_capture_id.restype = ctypes.c_uint64
+            self.core.wp_cuda_stream_get_priority.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_stream_get_priority.restype = ctypes.c_int
 
-            self.core.cuda_event_create.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-            self.core.cuda_event_create.restype = ctypes.c_void_p
-            self.core.cuda_event_destroy.argtypes = [ctypes.c_void_p]
-            self.core.cuda_event_destroy.restype = None
-            self.core.cuda_event_query.argtypes = [ctypes.c_void_p]
-            self.core.cuda_event_query.restype = ctypes.c_int
-            self.core.cuda_event_record.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
-            self.core.cuda_event_record.restype = None
-            self.core.cuda_event_synchronize.argtypes = [ctypes.c_void_p]
-            self.core.cuda_event_synchronize.restype = None
-            self.core.cuda_event_elapsed_time.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_event_elapsed_time.restype = ctypes.c_float
+            self.core.wp_cuda_event_create.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            self.core.wp_cuda_event_create.restype = ctypes.c_void_p
+            self.core.wp_cuda_event_destroy.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_event_destroy.restype = None
+            self.core.wp_cuda_event_query.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_event_query.restype = ctypes.c_int
+            self.core.wp_cuda_event_record.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
+            self.core.wp_cuda_event_record.restype = None
+            self.core.wp_cuda_event_synchronize.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_event_synchronize.restype = None
+            self.core.wp_cuda_event_elapsed_time.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_event_elapsed_time.restype = ctypes.c_float
 
-            self.core.cuda_graph_begin_capture.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
-            self.core.cuda_graph_begin_capture.restype = ctypes.c_bool
-            self.core.cuda_graph_end_capture.argtypes = [
+            self.core.wp_cuda_graph_begin_capture.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+            self.core.wp_cuda_graph_begin_capture.restype = ctypes.c_bool
+            self.core.wp_cuda_graph_end_capture.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.POINTER(ctypes.c_void_p),
             ]
-            self.core.cuda_graph_end_capture.restype = ctypes.c_bool
-            self.core.cuda_graph_launch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_graph_launch.restype = ctypes.c_bool
-            self.core.cuda_graph_destroy.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_graph_destroy.restype = ctypes.c_bool
+            self.core.wp_cuda_graph_end_capture.restype = ctypes.c_bool
 
-            self.core.cuda_compile_program.argtypes = [
+            self.core.wp_cuda_graph_create_exec.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            self.core.wp_cuda_graph_create_exec.restype = ctypes.c_bool
+
+            self.core.wp_capture_debug_dot_print.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+            self.core.wp_capture_debug_dot_print.restype = ctypes.c_bool
+
+            self.core.wp_cuda_graph_launch.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_graph_launch.restype = ctypes.c_bool
+            self.core.wp_cuda_graph_exec_destroy.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_graph_exec_destroy.restype = ctypes.c_bool
+
+            self.core.wp_cuda_graph_destroy.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_graph_destroy.restype = ctypes.c_bool
+
+            self.core.wp_cuda_graph_insert_if_else.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            self.core.wp_cuda_graph_insert_if_else.restype = ctypes.c_bool
+
+            self.core.wp_cuda_graph_insert_while.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_uint64),
+            ]
+            self.core.wp_cuda_graph_insert_while.restype = ctypes.c_bool
+
+            self.core.wp_cuda_graph_set_condition.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.c_uint64,
+            ]
+            self.core.wp_cuda_graph_set_condition.restype = ctypes.c_bool
+
+            self.core.wp_cuda_graph_pause_capture.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            self.core.wp_cuda_graph_pause_capture.restype = ctypes.c_bool
+
+            self.core.wp_cuda_graph_resume_capture.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+            self.core.wp_cuda_graph_resume_capture.restype = ctypes.c_bool
+
+            self.core.wp_cuda_graph_insert_child_graph.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+            self.core.wp_cuda_graph_insert_child_graph.restype = ctypes.c_bool
+
+            self.core.wp_cuda_graph_check_conditional_body.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_graph_check_conditional_body.restype = ctypes.c_bool
+
+            self.core.wp_cuda_compile_program.argtypes = [
                 ctypes.c_char_p,  # cuda_src
                 ctypes.c_char_p,  # program name
                 ctypes.c_int,  # arch
@@ -3746,9 +4109,9 @@ class Runtime:
                 ctypes.POINTER(ctypes.c_size_t),  # ltoir_sizes
                 ctypes.POINTER(ctypes.c_int),  # ltoir_input_types, each of type nvJitLinkInputType
             ]
-            self.core.cuda_compile_program.restype = ctypes.c_size_t
+            self.core.wp_cuda_compile_program.restype = ctypes.c_size_t
 
-            self.core.cuda_compile_fft.argtypes = [
+            self.core.wp_cuda_compile_fft.argtypes = [
                 ctypes.c_char_p,  # lto
                 ctypes.c_char_p,  # function name
                 ctypes.c_int,  # num include dirs
@@ -3761,9 +4124,9 @@ class Runtime:
                 ctypes.c_int,  # precision
                 ctypes.POINTER(ctypes.c_int),  # smem (out)
             ]
-            self.core.cuda_compile_fft.restype = ctypes.c_bool
+            self.core.wp_cuda_compile_fft.restype = ctypes.c_bool
 
-            self.core.cuda_compile_dot.argtypes = [
+            self.core.wp_cuda_compile_dot.argtypes = [
                 ctypes.c_char_p,  # lto
                 ctypes.c_char_p,  # function name
                 ctypes.c_int,  # num include dirs
@@ -3782,9 +4145,9 @@ class Runtime:
                 ctypes.c_int,  # c_arrangement
                 ctypes.c_int,  # num threads
             ]
-            self.core.cuda_compile_dot.restype = ctypes.c_bool
+            self.core.wp_cuda_compile_dot.restype = ctypes.c_bool
 
-            self.core.cuda_compile_solver.argtypes = [
+            self.core.wp_cuda_compile_solver.argtypes = [
                 ctypes.c_char_p,  # universal fatbin
                 ctypes.c_char_p,  # lto
                 ctypes.c_char_p,  # function name
@@ -3794,28 +4157,34 @@ class Runtime:
                 ctypes.c_int,  # arch
                 ctypes.c_int,  # M
                 ctypes.c_int,  # N
+                ctypes.c_int,  # NRHS
+                ctypes.c_int,  # function
+                ctypes.c_int,  # side
+                ctypes.c_int,  # diag
                 ctypes.c_int,  # precision
+                ctypes.c_int,  # a_arrangement
+                ctypes.c_int,  # b_arrangement
                 ctypes.c_int,  # fill_mode
                 ctypes.c_int,  # num threads
             ]
-            self.core.cuda_compile_fft.restype = ctypes.c_bool
+            self.core.wp_cuda_compile_solver.restype = ctypes.c_bool
 
-            self.core.cuda_load_module.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-            self.core.cuda_load_module.restype = ctypes.c_void_p
+            self.core.wp_cuda_load_module.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            self.core.wp_cuda_load_module.restype = ctypes.c_void_p
 
-            self.core.cuda_unload_module.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_unload_module.restype = None
+            self.core.wp_cuda_unload_module.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_unload_module.restype = None
 
-            self.core.cuda_get_kernel.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
-            self.core.cuda_get_kernel.restype = ctypes.c_void_p
+            self.core.wp_cuda_get_kernel.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
+            self.core.wp_cuda_get_kernel.restype = ctypes.c_void_p
 
-            self.core.cuda_get_max_shared_memory.argtypes = [ctypes.c_void_p]
-            self.core.cuda_get_max_shared_memory.restype = ctypes.c_int
+            self.core.wp_cuda_get_max_shared_memory.argtypes = [ctypes.c_void_p]
+            self.core.wp_cuda_get_max_shared_memory.restype = ctypes.c_int
 
-            self.core.cuda_configure_kernel_shared_memory.argtypes = [ctypes.c_void_p, ctypes.c_int]
-            self.core.cuda_configure_kernel_shared_memory.restype = ctypes.c_bool
+            self.core.wp_cuda_configure_kernel_shared_memory.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            self.core.wp_cuda_configure_kernel_shared_memory.restype = ctypes.c_bool
 
-            self.core.cuda_launch_kernel.argtypes = [
+            self.core.wp_cuda_launch_kernel.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_size_t,
@@ -3825,54 +4194,54 @@ class Runtime:
                 ctypes.POINTER(ctypes.c_void_p),
                 ctypes.c_void_p,
             ]
-            self.core.cuda_launch_kernel.restype = ctypes.c_size_t
+            self.core.wp_cuda_launch_kernel.restype = ctypes.c_size_t
 
-            self.core.cuda_graphics_map.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_graphics_map.restype = None
-            self.core.cuda_graphics_unmap.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_graphics_unmap.restype = None
-            self.core.cuda_graphics_device_ptr_and_size.argtypes = [
+            self.core.wp_cuda_graphics_map.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_graphics_map.restype = None
+            self.core.wp_cuda_graphics_unmap.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_graphics_unmap.restype = None
+            self.core.wp_cuda_graphics_device_ptr_and_size.argtypes = [
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.POINTER(ctypes.c_uint64),
                 ctypes.POINTER(ctypes.c_size_t),
             ]
-            self.core.cuda_graphics_device_ptr_and_size.restype = None
-            self.core.cuda_graphics_register_gl_buffer.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint]
-            self.core.cuda_graphics_register_gl_buffer.restype = ctypes.c_void_p
-            self.core.cuda_graphics_unregister_resource.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-            self.core.cuda_graphics_unregister_resource.restype = None
+            self.core.wp_cuda_graphics_device_ptr_and_size.restype = None
+            self.core.wp_cuda_graphics_register_gl_buffer.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint]
+            self.core.wp_cuda_graphics_register_gl_buffer.restype = ctypes.c_void_p
+            self.core.wp_cuda_graphics_unregister_resource.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            self.core.wp_cuda_graphics_unregister_resource.restype = None
 
-            self.core.cuda_timing_begin.argtypes = [ctypes.c_int]
-            self.core.cuda_timing_begin.restype = None
-            self.core.cuda_timing_get_result_count.argtypes = []
-            self.core.cuda_timing_get_result_count.restype = int
-            self.core.cuda_timing_end.argtypes = []
-            self.core.cuda_timing_end.restype = None
+            self.core.wp_cuda_timing_begin.argtypes = [ctypes.c_int]
+            self.core.wp_cuda_timing_begin.restype = None
+            self.core.wp_cuda_timing_get_result_count.argtypes = []
+            self.core.wp_cuda_timing_get_result_count.restype = int
+            self.core.wp_cuda_timing_end.argtypes = []
+            self.core.wp_cuda_timing_end.restype = None
 
-            self.core.graph_coloring.argtypes = [
+            self.core.wp_graph_coloring.argtypes = [
                 ctypes.c_int,
                 warp.types.array_t,
                 ctypes.c_int,
                 warp.types.array_t,
             ]
-            self.core.graph_coloring.restype = ctypes.c_int
+            self.core.wp_graph_coloring.restype = ctypes.c_int
 
-            self.core.balance_coloring.argtypes = [
+            self.core.wp_balance_coloring.argtypes = [
                 ctypes.c_int,
                 warp.types.array_t,
                 ctypes.c_int,
                 ctypes.c_float,
                 warp.types.array_t,
             ]
-            self.core.balance_coloring.restype = ctypes.c_float
+            self.core.wp_balance_coloring.restype = ctypes.c_float
 
-            self.core.init.restype = ctypes.c_int
+            self.core.wp_init.restype = ctypes.c_int
 
         except AttributeError as e:
             raise RuntimeError(f"Setting C-types for {warp_lib} failed. It may need rebuilding.") from e
 
-        error = self.core.init()
+        error = self.core.wp_init()
 
         if error != 0:
             raise Exception("Warp initialization failed")
@@ -3888,8 +4257,8 @@ class Runtime:
         self.device_map["cpu"] = self.cpu_device
         self.context_map[None] = self.cpu_device
 
-        self.is_cuda_enabled = bool(self.core.is_cuda_enabled())
-        self.is_cuda_compatibility_enabled = bool(self.core.is_cuda_compatibility_enabled())
+        self.is_cuda_enabled = bool(self.core.wp_is_cuda_enabled())
+        self.is_cuda_compatibility_enabled = bool(self.core.wp_is_cuda_compatibility_enabled())
 
         self.toolkit_version = None  # CTK version used to build the core lib
         self.driver_version = None  # installed driver version
@@ -3902,12 +4271,15 @@ class Runtime:
 
         if self.is_cuda_enabled:
             # get CUDA Toolkit and driver versions
-            toolkit_version = self.core.cuda_toolkit_version()
-            driver_version = self.core.cuda_driver_version()
-
-            # save versions as tuples, e.g., (12, 4)
+            toolkit_version = self.core.wp_cuda_toolkit_version()
             self.toolkit_version = (toolkit_version // 1000, (toolkit_version % 1000) // 10)
-            self.driver_version = (driver_version // 1000, (driver_version % 1000) // 10)
+
+            if self.core.wp_cuda_driver_is_initialized():
+                # save versions as tuples, e.g., (12, 4)
+                driver_version = self.core.wp_cuda_driver_version()
+                self.driver_version = (driver_version // 1000, (driver_version % 1000) // 10)
+            else:
+                self.driver_version = None
 
             # determine minimum required driver version
             if self.is_cuda_compatibility_enabled:
@@ -3921,18 +4293,18 @@ class Runtime:
                 self.min_driver_version = self.toolkit_version
 
             # determine if the installed driver is sufficient
-            if self.driver_version >= self.min_driver_version:
+            if self.driver_version is not None and self.driver_version >= self.min_driver_version:
                 # get all architectures supported by NVRTC
-                num_archs = self.core.nvrtc_supported_arch_count()
+                num_archs = self.core.wp_nvrtc_supported_arch_count()
                 if num_archs > 0:
                     archs = (ctypes.c_int * num_archs)()
-                    self.core.nvrtc_supported_archs(archs)
+                    self.core.wp_nvrtc_supported_archs(archs)
                     self.nvrtc_supported_archs = set(archs)
                 else:
                     self.nvrtc_supported_archs = set()
 
                 # get CUDA device count
-                cuda_device_count = self.core.cuda_device_get_count()
+                cuda_device_count = self.core.wp_cuda_device_get_count()
 
                 # register primary CUDA devices
                 for i in range(cuda_device_count):
@@ -3949,7 +4321,7 @@ class Runtime:
         # set default device
         if cuda_device_count > 0:
             # stick with the current cuda context, if one is bound
-            initial_context = self.core.cuda_context_get_current()
+            initial_context = self.core.wp_cuda_context_get_current()
             if initial_context is not None:
                 self.set_default_device("cuda")
                 # if this is a non-primary context that was just registered, update the device count
@@ -3963,9 +4335,14 @@ class Runtime:
             # Update the default PTX architecture based on devices present in the system.
             # Use the lowest architecture among devices that meet the minimum architecture requirement.
             # Devices below the required minimum will use the highest architecture they support.
-            eligible_archs = [d.arch for d in self.cuda_devices if d.arch >= self.default_ptx_arch]
-            if eligible_archs:
-                self.default_ptx_arch = min(eligible_archs)
+            try:
+                self.default_ptx_arch = min(
+                    d.arch
+                    for d in self.cuda_devices
+                    if d.arch >= self.default_ptx_arch and d.arch in self.nvrtc_supported_archs
+                )
+            except ValueError:
+                pass  # no eligible NVRTC-supported arch ≥ default, retain existing
         else:
             # CUDA not available
             self.set_default_device("cpu")
@@ -3997,6 +4374,8 @@ class Runtime:
                 if not self.is_cuda_enabled:
                     # Warp was compiled without CUDA support
                     greeting.append("   CUDA not enabled in this build")
+                elif self.driver_version is None:
+                    greeting.append("   CUDA driver not found or failed to initialize")
                 elif self.driver_version < self.min_driver_version:
                     # insufficient CUDA driver version
                     greeting.append(
@@ -4040,7 +4419,7 @@ class Runtime:
                             access_vector.append(1)
                         else:
                             peer_device = self.cuda_devices[j]
-                            can_access = self.core.cuda_is_peer_access_supported(
+                            can_access = self.core.wp_cuda_is_peer_access_supported(
                                 target_device.ordinal, peer_device.ordinal
                             )
                             access_vector.append(can_access)
@@ -4065,7 +4444,7 @@ class Runtime:
 
         if cuda_device_count > 0:
             # ensure initialization did not change the initial context (e.g. querying available memory)
-            self.core.cuda_context_set_current(initial_context)
+            self.core.wp_cuda_context_set_current(initial_context)
 
             # detect possible misconfiguration of the system
             devices_without_uva = []
@@ -4093,7 +4472,7 @@ class Runtime:
         elif self.is_cuda_enabled:
             # Report a warning about insufficient driver version.  The warning should appear even in quiet mode
             # when the greeting message is suppressed.  Also try to provide guidance for resolving the situation.
-            if self.driver_version < self.min_driver_version:
+            if self.driver_version is not None and self.driver_version < self.min_driver_version:
                 msg = []
                 msg.append("\n   Insufficient CUDA driver version.")
                 msg.append(
@@ -4104,7 +4483,7 @@ class Runtime:
                 warp.utils.warn("\n   ".join(msg))
 
     def get_error_string(self):
-        return self.core.get_error_string().decode("utf-8")
+        return self.core.wp_get_error_string().decode("utf-8")
 
     def load_dll(self, dll_path):
         try:
@@ -4140,21 +4519,21 @@ class Runtime:
         self.default_device = self.get_device(ident)
 
     def get_current_cuda_device(self) -> Device:
-        current_context = self.core.cuda_context_get_current()
+        current_context = self.core.wp_cuda_context_get_current()
         if current_context is not None:
             current_device = self.context_map.get(current_context)
             if current_device is not None:
                 # this is a known device
                 return current_device
-            elif self.core.cuda_context_is_primary(current_context):
+            elif self.core.wp_cuda_context_is_primary(current_context):
                 # this is a primary context that we haven't used yet
-                ordinal = self.core.cuda_context_get_device_ordinal(current_context)
+                ordinal = self.core.wp_cuda_context_get_device_ordinal(current_context)
                 device = self.cuda_devices[ordinal]
                 self.context_map[current_context] = device
                 return device
             else:
                 # this is an unseen non-primary context, register it as a new device with a unique alias
-                ordinal = self.core.cuda_context_get_device_ordinal(current_context)
+                ordinal = self.core.wp_cuda_context_get_device_ordinal(current_context)
                 alias = f"cuda:{ordinal}.{self.cuda_custom_context_count[ordinal]}"
                 self.cuda_custom_context_count[ordinal] += 1
                 return self.map_cuda_device(alias, current_context)
@@ -4177,7 +4556,7 @@ class Runtime:
 
     def map_cuda_device(self, alias, context=None) -> Device:
         if context is None:
-            context = self.core.cuda_context_get_current()
+            context = self.core.wp_cuda_context_get_current()
             if context is None:
                 raise RuntimeError(f"Unable to determine CUDA context for device alias '{alias}'")
 
@@ -4199,10 +4578,10 @@ class Runtime:
             # it's an unmapped context
 
             # get the device ordinal
-            ordinal = self.core.cuda_context_get_device_ordinal(context)
+            ordinal = self.core.wp_cuda_context_get_device_ordinal(context)
 
             # check if this is a primary context (we could get here if it's a device that hasn't been used yet)
-            if self.core.cuda_context_is_primary(context):
+            if self.core.wp_cuda_context_is_primary(context):
                 # rename the device
                 device = self.cuda_primary_devices[ordinal]
                 return self.rename_device(device, alias)
@@ -4233,7 +4612,7 @@ class Runtime:
             if not device.is_cuda:
                 return
 
-            err = self.core.cuda_context_check(device.context)
+            err = self.core.wp_cuda_context_check(device.context)
             if err != 0:
                 raise RuntimeError(f"CUDA error detected: {err}")
 
@@ -4265,7 +4644,7 @@ def is_cuda_driver_initialized() -> bool:
     """
     init()
 
-    return runtime.core.cuda_driver_is_initialized()
+    return runtime.core.wp_cuda_driver_is_initialized()
 
 
 def get_devices() -> list[Device]:
@@ -4473,7 +4852,7 @@ def set_mempool_release_threshold(device: Devicelike, threshold: int | float) ->
     elif threshold > 0 and threshold <= 1:
         threshold = int(threshold * device.total_memory)
 
-    if not runtime.core.cuda_device_set_mempool_release_threshold(device.ordinal, threshold):
+    if not runtime.core.wp_cuda_device_set_mempool_release_threshold(device.ordinal, threshold):
         raise RuntimeError(f"Failed to set memory pool release threshold for device {device}")
 
 
@@ -4503,7 +4882,7 @@ def get_mempool_release_threshold(device: Devicelike = None) -> int:
     if not device.is_mempool_supported:
         raise RuntimeError(f"Device {device} does not support memory pools")
 
-    return runtime.core.cuda_device_get_mempool_release_threshold(device.ordinal)
+    return runtime.core.wp_cuda_device_get_mempool_release_threshold(device.ordinal)
 
 
 def get_mempool_used_mem_current(device: Devicelike = None) -> int:
@@ -4532,7 +4911,7 @@ def get_mempool_used_mem_current(device: Devicelike = None) -> int:
     if not device.is_mempool_supported:
         raise RuntimeError(f"Device {device} does not support memory pools")
 
-    return runtime.core.cuda_device_get_mempool_used_mem_current(device.ordinal)
+    return runtime.core.wp_cuda_device_get_mempool_used_mem_current(device.ordinal)
 
 
 def get_mempool_used_mem_high(device: Devicelike = None) -> int:
@@ -4561,7 +4940,7 @@ def get_mempool_used_mem_high(device: Devicelike = None) -> int:
     if not device.is_mempool_supported:
         raise RuntimeError(f"Device {device} does not support memory pools")
 
-    return runtime.core.cuda_device_get_mempool_used_mem_high(device.ordinal)
+    return runtime.core.wp_cuda_device_get_mempool_used_mem_high(device.ordinal)
 
 
 def is_peer_access_supported(target_device: Devicelike, peer_device: Devicelike) -> bool:
@@ -4582,7 +4961,7 @@ def is_peer_access_supported(target_device: Devicelike, peer_device: Devicelike)
     if not target_device.is_cuda or not peer_device.is_cuda:
         return False
 
-    return bool(runtime.core.cuda_is_peer_access_supported(target_device.ordinal, peer_device.ordinal))
+    return bool(runtime.core.wp_cuda_is_peer_access_supported(target_device.ordinal, peer_device.ordinal))
 
 
 def is_peer_access_enabled(target_device: Devicelike, peer_device: Devicelike) -> bool:
@@ -4603,7 +4982,7 @@ def is_peer_access_enabled(target_device: Devicelike, peer_device: Devicelike) -
     if not target_device.is_cuda or not peer_device.is_cuda:
         return False
 
-    return bool(runtime.core.cuda_is_peer_access_enabled(target_device.context, peer_device.context))
+    return bool(runtime.core.wp_cuda_is_peer_access_enabled(target_device.context, peer_device.context))
 
 
 def set_peer_access_enabled(target_device: Devicelike, peer_device: Devicelike, enable: bool) -> None:
@@ -4633,7 +5012,7 @@ def set_peer_access_enabled(target_device: Devicelike, peer_device: Devicelike, 
         else:
             return
 
-    if not runtime.core.cuda_set_peer_access_enabled(target_device.context, peer_device.context, int(enable)):
+    if not runtime.core.wp_cuda_set_peer_access_enabled(target_device.context, peer_device.context, int(enable)):
         action = "enable" if enable else "disable"
         raise RuntimeError(f"Failed to {action} peer access from device {peer_device} to device {target_device}")
 
@@ -4674,7 +5053,7 @@ def is_mempool_access_enabled(target_device: Devicelike, peer_device: Devicelike
     if not peer_device.is_cuda or not target_device.is_cuda or not target_device.is_mempool_supported:
         return False
 
-    return bool(runtime.core.cuda_is_mempool_access_enabled(target_device.ordinal, peer_device.ordinal))
+    return bool(runtime.core.wp_cuda_is_mempool_access_enabled(target_device.ordinal, peer_device.ordinal))
 
 
 def set_mempool_access_enabled(target_device: Devicelike, peer_device: Devicelike, enable: bool) -> None:
@@ -4707,7 +5086,7 @@ def set_mempool_access_enabled(target_device: Devicelike, peer_device: Devicelik
         else:
             return
 
-    if not runtime.core.cuda_set_mempool_access_enabled(target_device.ordinal, peer_device.ordinal, int(enable)):
+    if not runtime.core.wp_cuda_set_mempool_access_enabled(target_device.ordinal, peer_device.ordinal, int(enable)):
         action = "enable" if enable else "disable"
         raise RuntimeError(f"Failed to {action} memory pool access from device {peer_device} to device {target_device}")
 
@@ -4788,7 +5167,7 @@ def get_event_elapsed_time(start_event: Event, end_event: Event, synchronize: bo
     if synchronize:
         synchronize_event(end_event)
 
-    return runtime.core.cuda_event_elapsed_time(start_event.cuda_event, end_event.cuda_event)
+    return runtime.core.wp_cuda_event_elapsed_time(start_event.cuda_event, end_event.cuda_event)
 
 
 def wait_stream(other_stream: Stream, event: Event | None = None):
@@ -4882,7 +5261,7 @@ class RegisteredGLBuffer:
         self.context = self.device.context
         self.flags = flags
         self.fallback_to_copy = fallback_to_copy
-        self.resource = runtime.core.cuda_graphics_register_gl_buffer(self.context, gl_buffer_id, flags)
+        self.resource = runtime.core.wp_cuda_graphics_register_gl_buffer(self.context, gl_buffer_id, flags)
         if self.resource is None:
             if self.fallback_to_copy:
                 self.warp_buffer = None
@@ -4901,7 +5280,7 @@ class RegisteredGLBuffer:
 
         # use CUDA context guard to avoid side effects during garbage collection
         with self.device.context_guard:
-            runtime.core.cuda_graphics_unregister_resource(self.context, self.resource)
+            runtime.core.wp_cuda_graphics_unregister_resource(self.context, self.resource)
 
     def map(self, dtype, shape) -> warp.array:
         """Map the OpenGL buffer to a Warp array.
@@ -4914,10 +5293,10 @@ class RegisteredGLBuffer:
             A Warp array object representing the mapped OpenGL buffer.
         """
         if self.resource is not None:
-            runtime.core.cuda_graphics_map(self.context, self.resource)
+            runtime.core.wp_cuda_graphics_map(self.context, self.resource)
             ptr = ctypes.c_uint64(0)
             size = ctypes.c_size_t(0)
-            runtime.core.cuda_graphics_device_ptr_and_size(
+            runtime.core.wp_cuda_graphics_device_ptr_and_size(
                 self.context, self.resource, ctypes.byref(ptr), ctypes.byref(size)
             )
             return warp.array(ptr=ptr.value, dtype=dtype, shape=shape, device=self.device)
@@ -4942,7 +5321,7 @@ class RegisteredGLBuffer:
     def unmap(self):
         """Unmap the OpenGL buffer."""
         if self.resource is not None:
-            runtime.core.cuda_graphics_unmap(self.context, self.resource)
+            runtime.core.wp_cuda_graphics_unmap(self.context, self.resource)
         elif self.fallback_to_copy:
             if self.warp_buffer is None:
                 raise RuntimeError("RegisteredGLBuffer first has to be mapped")
@@ -5298,7 +5677,7 @@ def event_from_ipc_handle(handle, device: Devicelike = None) -> Event:
         raise RuntimeError(f"IPC is not supported on device {device}.")
 
     event = Event(
-        device=device, cuda_event=warp.context.runtime.core.cuda_ipc_open_event_handle(device.context, handle)
+        device=device, cuda_event=warp.context.runtime.core.wp_cuda_ipc_open_event_handle(device.context, handle)
     )
     # Events created from IPC handles must be freed with cuEventDestroy
     event.owner = True
@@ -5428,6 +5807,35 @@ def pack_arg(kernel, arg_type, arg_name, value, device, adjoint=False):
                 "Error launching kernel, unable to pack kernel parameter type "
                 f"{type(value)} for param {arg_name}, expected {arg_type}"
             ) from e
+
+
+# invoke a CPU kernel by passing the parameters as a ctypes structure
+def invoke(kernel, hooks, params: Sequence[Any], adjoint: bool):
+    fields = []
+
+    for i in range(0, len(kernel.adj.args)):
+        arg_name = kernel.adj.args[i].label
+        field = (arg_name, type(params[1 + i]))  # skip the first argument, which is the launch bounds
+        fields.append(field)
+
+    ArgsStruct = type("ArgsStruct", (ctypes.Structure,), {"_fields_": fields})
+
+    args = ArgsStruct()
+    for i, field in enumerate(fields):
+        name = field[0]
+        setattr(args, name, params[1 + i])
+
+    if not adjoint:
+        hooks.forward(params[0], ctypes.byref(args))
+
+    # for adjoint kernels the adjoint arguments are passed through a second struct
+    else:
+        adj_args = ArgsStruct()
+        for i, field in enumerate(fields):
+            name = field[0]
+            setattr(adj_args, name, params[1 + len(fields) + i])
+
+        hooks.backward(params[0], ctypes.byref(args), ctypes.byref(adj_args))
 
 
 class Launch:
@@ -5622,24 +6030,21 @@ class Launch:
             stream: The stream to launch on.
         """
         if self.device.is_cpu:
-            if self.adjoint:
-                self.hooks.backward(*self.params)
-            else:
-                self.hooks.forward(*self.params)
+            invoke(self.kernel, self.hooks, self.params, self.adjoint)
         else:
             if stream is None:
                 stream = self.device.stream
 
             # If the stream is capturing, we retain the CUDA module so that it doesn't get unloaded
             # before the captured graph is released.
-            if runtime.core.cuda_stream_is_capturing(stream.cuda_stream):
-                capture_id = runtime.core.cuda_stream_get_capture_id(stream.cuda_stream)
+            if len(runtime.captures) > 0 and runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
+                capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
                 graph = runtime.captures.get(capture_id)
                 if graph is not None:
                     graph.retain_module_exec(self.module_exec)
 
             if self.adjoint:
-                runtime.core.cuda_launch_kernel(
+                runtime.core.wp_cuda_launch_kernel(
                     self.device.context,
                     self.hooks.backward,
                     self.bounds.size,
@@ -5650,7 +6055,7 @@ class Launch:
                     stream.cuda_stream,
                 )
             else:
-                runtime.core.cuda_launch_kernel(
+                runtime.core.wp_cuda_launch_kernel(
                     self.device.context,
                     self.hooks.forward,
                     self.bounds.size,
@@ -5769,7 +6174,7 @@ def launch(
         # late bind
         hooks = module_exec.get_kernel_hooks(kernel)
 
-        pack_args(fwd_args, params)
+        pack_args(fwd_args, params, adjoint=False)
         pack_args(adj_args, params, adjoint=True)
 
         # run kernel
@@ -5780,38 +6185,25 @@ def launch(
                         f"Failed to find backward kernel '{kernel.key}' from module '{kernel.module.name}' for device '{device}'"
                     )
 
-                if record_cmd:
-                    launch = Launch(
-                        kernel=kernel,
-                        hooks=hooks,
-                        params=params,
-                        params_addr=None,
-                        bounds=bounds,
-                        device=device,
-                        adjoint=adjoint,
-                    )
-                    return launch
-                hooks.backward(*params)
-
             else:
                 if hooks.forward is None:
                     raise RuntimeError(
                         f"Failed to find forward kernel '{kernel.key}' from module '{kernel.module.name}' for device '{device}'"
                     )
 
-                if record_cmd:
-                    launch = Launch(
-                        kernel=kernel,
-                        hooks=hooks,
-                        params=params,
-                        params_addr=None,
-                        bounds=bounds,
-                        device=device,
-                        adjoint=adjoint,
-                    )
-                    return launch
-                else:
-                    hooks.forward(*params)
+            if record_cmd:
+                launch = Launch(
+                    kernel=kernel,
+                    hooks=hooks,
+                    params=params,
+                    params_addr=None,
+                    bounds=bounds,
+                    device=device,
+                    adjoint=adjoint,
+                )
+                return launch
+
+            invoke(kernel, hooks, params, adjoint)
 
         else:
             kernel_args = [ctypes.c_void_p(ctypes.addressof(x)) for x in params]
@@ -5822,8 +6214,8 @@ def launch(
 
             # If the stream is capturing, we retain the CUDA module so that it doesn't get unloaded
             # before the captured graph is released.
-            if runtime.core.cuda_stream_is_capturing(stream.cuda_stream):
-                capture_id = runtime.core.cuda_stream_get_capture_id(stream.cuda_stream)
+            if len(runtime.captures) > 0 and runtime.core.wp_cuda_stream_is_capturing(stream.cuda_stream):
+                capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
                 graph = runtime.captures.get(capture_id)
                 if graph is not None:
                     graph.retain_module_exec(module_exec)
@@ -5848,7 +6240,7 @@ def launch(
                     )
                     return launch
                 else:
-                    runtime.core.cuda_launch_kernel(
+                    runtime.core.wp_cuda_launch_kernel(
                         device.context,
                         hooks.backward,
                         bounds.size,
@@ -5879,7 +6271,7 @@ def launch(
                     return launch
                 else:
                     # launch
-                    runtime.core.cuda_launch_kernel(
+                    runtime.core.wp_cuda_launch_kernel(
                         device.context,
                         hooks.forward,
                         bounds.size,
@@ -5981,7 +6373,7 @@ def synchronize():
 
     if is_cuda_driver_initialized():
         # save the original context to avoid side effects
-        saved_context = runtime.core.cuda_context_get_current()
+        saved_context = runtime.core.wp_cuda_context_get_current()
 
         # TODO: only synchronize devices that have outstanding work
         for device in runtime.cuda_devices:
@@ -5990,10 +6382,10 @@ def synchronize():
                 if device.is_capturing:
                     raise RuntimeError(f"Cannot synchronize device {device} while graph capture is active")
 
-                runtime.core.cuda_context_synchronize(device.context)
+                runtime.core.wp_cuda_context_synchronize(device.context)
 
         # restore the original context to avoid side effects
-        runtime.core.cuda_context_set_current(saved_context)
+        runtime.core.wp_cuda_context_set_current(saved_context)
 
 
 def synchronize_device(device: Devicelike = None):
@@ -6011,7 +6403,7 @@ def synchronize_device(device: Devicelike = None):
         if device.is_capturing:
             raise RuntimeError(f"Cannot synchronize device {device} while graph capture is active")
 
-        runtime.core.cuda_context_synchronize(device.context)
+        runtime.core.wp_cuda_context_synchronize(device.context)
 
 
 def synchronize_stream(stream_or_device: Stream | Devicelike | None = None):
@@ -6029,7 +6421,7 @@ def synchronize_stream(stream_or_device: Stream | Devicelike | None = None):
     else:
         stream = runtime.get_device(stream_or_device).stream
 
-    runtime.core.cuda_stream_synchronize(stream.cuda_stream)
+    runtime.core.wp_cuda_stream_synchronize(stream.cuda_stream)
 
 
 def synchronize_event(event: Event):
@@ -6041,20 +6433,25 @@ def synchronize_event(event: Event):
         event: Event to wait for.
     """
 
-    runtime.core.cuda_event_synchronize(event.cuda_event)
+    runtime.core.wp_cuda_event_synchronize(event.cuda_event)
 
 
-def force_load(device: Device | str | list[Device] | list[str] | None = None, modules: list[Module] | None = None):
+def force_load(
+    device: Device | str | list[Device] | list[str] | None = None,
+    modules: list[Module] | None = None,
+    block_dim: int | None = None,
+):
     """Force user-defined kernels to be compiled and loaded
 
     Args:
         device: The device or list of devices to load the modules on.  If None, load on all devices.
         modules: List of modules to load.  If None, load all imported modules.
+        block_dim: The number of threads per block (always 1 for "cpu" devices).
     """
 
     if is_cuda_driver_initialized():
         # save original context to avoid side effects
-        saved_context = runtime.core.cuda_context_get_current()
+        saved_context = runtime.core.wp_cuda_context_get_current()
 
     if device is None:
         devices = get_devices()
@@ -6068,22 +6465,26 @@ def force_load(device: Device | str | list[Device] | list[str] | None = None, mo
 
     for d in devices:
         for m in modules:
-            m.load(d)
+            m.load(d, block_dim=block_dim)
 
     if is_cuda_available():
         # restore original context to avoid side effects
-        runtime.core.cuda_context_set_current(saved_context)
+        runtime.core.wp_cuda_context_set_current(saved_context)
 
 
 def load_module(
-    module: Module | types.ModuleType | str | None = None, device: Device | str | None = None, recursive: bool = False
+    module: Module | types.ModuleType | str | None = None,
+    device: Device | str | None = None,
+    recursive: bool = False,
+    block_dim: int | None = None,
 ):
-    """Force user-defined module to be compiled and loaded
+    """Force a user-defined module to be compiled and loaded
 
     Args:
         module: The module to load.  If None, load the current module.
         device: The device to load the modules on.  If None, load on all devices.
         recursive: Whether to load submodules.  E.g., if the given module is `warp.sim`, this will also load `warp.sim.model`, `warp.sim.articulation`, etc.
+        block_dim: The number of threads per block (always 1 for "cpu" devices).
 
     Note: A module must be imported before it can be loaded by this function.
     """
@@ -6104,9 +6505,13 @@ def load_module(
     modules = []
 
     # add the given module, if found
-    m = user_modules.get(module_name)
-    if m is not None:
-        modules.append(m)
+    if isinstance(module, Module):
+        # this ensures that we can load "unique" or procedural modules, which aren't added to `user_modules` by name
+        modules.append(module)
+    else:
+        m = user_modules.get(module_name)
+        if m is not None:
+            modules.append(m)
 
     # add submodules, if recursive
     if recursive:
@@ -6115,7 +6520,203 @@ def load_module(
             if name.startswith(prefix):
                 modules.append(mod)
 
-    force_load(device=device, modules=modules)
+    force_load(device=device, modules=modules, block_dim=block_dim)
+
+
+def _resolve_module(module: Module | types.ModuleType | str) -> Module:
+    """Resolve a module from a string, Module, or types.ModuleType.
+
+    Args:
+        module: The module to resolve.
+
+    Returns:
+        The resolved module.
+
+    Raises:
+        TypeError: If the module argument is not a Module, a types.ModuleType, or a string.
+    """
+
+    if isinstance(module, str):
+        module_object = get_module(module)
+    elif isinstance(module, Module):
+        module_object = module
+    elif isinstance(module, types.ModuleType):
+        module_object = get_module(module.__name__)
+    else:
+        raise TypeError(f"Argument 'module' must be a Module or a string, got {type(module)}")
+
+    return module_object
+
+
+def compile_aot_module(
+    module: Module | types.ModuleType | str,
+    device: Device | str | list[Device] | list[str] | None = None,
+    arch: int | Iterable[int] | None = None,
+    module_dir: str | os.PathLike | None = None,
+    use_ptx: bool | None = None,
+    strip_hash: bool | None = None,
+) -> None:
+    """Compile a module (ahead of time) for a given device.
+
+    Args:
+        module: The module to compile.
+        device: The device or devices to compile the module for. If ``None``,
+          and ``arch`` is not specified, compile the module for the current device.
+        arch: The architecture or architectures to compile the module for. If ``None``,
+          the architecture to compile for will be inferred from the current device.
+        module_dir: The directory to save the source, meta, and compiled files to.
+          If not specified, the module will be compiled to the default cache directory.
+        use_ptx: Whether to compile the module to PTX. This setting is only used
+          when compiling modules for the GPU. If ``None``, Warp will decide an
+          appropriate setting based on the runtime environment.
+        strip_hash: Whether to strip the hash from the module and kernel names.
+          Setting this value to ``True`` or ``False`` will update the module's
+          ``"strip_hash"`` option. If left at ``None``, the current value will
+          be used.
+
+          Warning: Do not enable ``strip_hash`` for modules that contain generic
+          kernels. Generic kernels compile to multiple overloads, and the
+          per-overload hash is required to distinguish them. Stripping the hash
+          in this case will cause the module to fail to compile.
+
+    Raises:
+        TypeError: If the module argument is not a Module, a types.ModuleType, or a string.
+    """
+
+    if is_cuda_driver_initialized():
+        # save original context to avoid side effects
+        saved_context = runtime.core.wp_cuda_context_get_current()
+
+    module_object = _resolve_module(module)
+
+    if strip_hash is not None:
+        module_object.options["strip_hash"] = strip_hash
+
+    if device is None and arch:
+        # User provided no device, but an arch, so we will not compile for the default device
+        devices = []
+    elif isinstance(device, list):
+        devices = [get_device(device_item) for device_item in device]
+    else:
+        devices = [get_device(device)]
+
+    for d in devices:
+        module_object.compile(d, module_dir, use_ptx=use_ptx)
+
+    if arch:
+        if isinstance(arch, str) or not hasattr(arch, "__iter__"):
+            arch = [arch]
+
+        for arch_value in arch:
+            module_object.compile(None, module_dir, output_arch=arch_value, use_ptx=use_ptx)
+
+    if is_cuda_available():
+        # restore original context to avoid side effects
+        runtime.core.wp_cuda_context_set_current(saved_context)
+
+
+def load_aot_module(
+    module: Module | types.ModuleType | str,
+    device: Device | str | list[Device] | list[str] | None = None,
+    arch: int | None = None,
+    module_dir: str | os.PathLike | None = None,
+    use_ptx: bool | None = None,
+    strip_hash: bool = False,
+) -> None:
+    """Load a previously compiled module (ahead of time).
+
+    Args:
+        module: The module to load.
+        device: The device or devices to load the module on. If ``None``,
+          load the module for the current device.
+        arch: The architecture to load the module for on all devices.
+          If ``None``, the architecture to load for will be inferred from the
+          current device.
+        module_dir: The directory to load the module from.
+          If not specified, the module will be loaded from the default cache directory.
+        use_ptx: Whether to load the module from PTX. This setting is only used
+          when loading modules for the GPU. If ``None`` on a CUDA device, Warp will
+          try both PTX and CUBIN (PTX first) and load the first that exists.
+          If neither exists, a ``FileNotFoundError`` is raised listing all
+          attempted paths.
+        strip_hash: Whether to strip the hash from the module and kernel names.
+          Setting this value to ``True`` or ``False`` will update the module's
+          ``"strip_hash"`` option. If left at ``None``, the current value will
+          be used.
+
+          Warning: Do not enable ``strip_hash`` for modules that contain generic
+          kernels. Generic kernels compile to multiple overloads, and the
+          per-overload hash is required to distinguish them. Stripping the hash
+          in this case will cause the module to fail to compile.
+
+    Raises:
+        FileNotFoundError: If no matching binary is found. When ``use_ptx`` is
+          ``None`` on a CUDA device, both PTX and CUBIN candidates are tried
+          before raising.
+        TypeError: If the module argument is not a Module, a types.ModuleType, or a string.
+    """
+
+    if is_cuda_driver_initialized():
+        # save original context to avoid side effects
+        saved_context = runtime.core.wp_cuda_context_get_current()
+
+    if device is None:
+        devices = [runtime.get_device()]
+    elif isinstance(device, list):
+        devices = [get_device(device_item) for device_item in device]
+    else:
+        devices = [get_device(device)]
+
+    module_object = _resolve_module(module)
+
+    if strip_hash is not None:
+        module_object.options["strip_hash"] = strip_hash
+
+    if module_dir is None:
+        module_dir = os.path.join(warp.config.kernel_cache_dir, module_object.get_module_identifier())
+    else:
+        module_dir = os.fspath(module_dir)
+
+    for d in devices:
+        # Identify the files in the cache to load
+        if arch is None:
+            output_arch = module_object.get_compile_arch(d)
+        else:
+            output_arch = arch
+
+        meta_path = os.path.join(module_dir, module_object.get_meta_name())
+
+        # Determine candidate binaries to try
+        tried_paths = []
+        binary_path = None
+        if d.is_cuda and use_ptx is None:
+            candidate_flags = (True, False)  # try PTX first, then CUBIN
+        else:
+            candidate_flags = (use_ptx,)
+
+        for candidate_use_ptx in candidate_flags:
+            candidate_path = os.path.join(
+                module_dir, module_object.get_compile_output_name(d, output_arch, candidate_use_ptx)
+            )
+            tried_paths.append(candidate_path)
+            if os.path.exists(candidate_path):
+                binary_path = candidate_path
+                break
+
+        if binary_path is None:
+            raise FileNotFoundError(f"Binary file not found. Tried: {', '.join(tried_paths)}")
+
+        module_object.load(
+            d,
+            block_dim=module_object.options["block_dim"],
+            binary_path=binary_path,
+            output_arch=output_arch,
+            meta_path=meta_path,
+        )
+
+    if is_cuda_available():
+        # restore original context to avoid side effects
+        runtime.core.wp_cuda_context_set_current(saved_context)
 
 
 def set_module_options(options: dict[str, Any], module: Any = None):
@@ -6150,6 +6751,40 @@ def get_module_options(module: Any = None) -> dict[str, Any]:
         m = module
 
     return get_module(m.__name__).options
+
+
+def _unregister_capture(device: Device, stream: Stream, graph: Graph):
+    """Unregister a graph capture from the device and runtime.
+
+    This should be called when a graph capture is no longer active, either because it completed or was paused.
+    The graph should only be registered while it is actively capturing.
+
+    Args:
+        device: The CUDA device the graph was being captured on
+        stream: The CUDA stream the graph was being captured on
+        graph: The Graph object that was being captured
+    """
+    del device.captures[stream]
+    del runtime.captures[graph.capture_id]
+
+
+def _register_capture(device: Device, stream: Stream, graph: Graph, capture_id: int):
+    """Register a graph capture with the device and runtime.
+
+    Makes the graph discoverable through its capture_id so that retain_module_exec() can be called
+    when launching kernels during graph capture. This ensures modules are retained until graph execution completes.
+
+    Args:
+        device: The CUDA device the graph is being captured on
+        stream: The CUDA stream the graph is being captured on
+        graph: The Graph object being captured
+        capture_id: Unique identifier for this graph capture
+    """
+    # add to ongoing captures on the device
+    device.captures[stream] = graph
+
+    # add to lookup table by globally unique capture id
+    runtime.captures[capture_id] = graph
 
 
 def capture_begin(
@@ -6211,17 +6846,13 @@ def capture_begin(
         if force_module_load:
             force_load(device)
 
-    if not runtime.core.cuda_graph_begin_capture(device.context, stream.cuda_stream, int(external)):
+    if not runtime.core.wp_cuda_graph_begin_capture(device.context, stream.cuda_stream, int(external)):
         raise RuntimeError(runtime.get_error_string())
 
-    capture_id = runtime.core.cuda_stream_get_capture_id(stream.cuda_stream)
+    capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
     graph = Graph(device, capture_id)
 
-    # add to ongoing captures on the device
-    device.captures[stream] = graph
-
-    # add to lookup table by globally unique capture id
-    runtime.captures[capture_id] = graph
+    _register_capture(device, stream, graph, capture_id)
 
 
 def capture_end(device: Devicelike = None, stream: Stream | None = None) -> Graph:
@@ -6249,21 +6880,356 @@ def capture_end(device: Devicelike = None, stream: Stream | None = None) -> Grap
     if graph is None:
         raise RuntimeError("Graph capture is not active on this stream")
 
-    del device.captures[stream]
-    del runtime.captures[graph.capture_id]
+    _unregister_capture(device, stream, graph)
 
     # get the graph executable
-    graph_exec = ctypes.c_void_p()
-    result = runtime.core.cuda_graph_end_capture(device.context, stream.cuda_stream, ctypes.byref(graph_exec))
+    g = ctypes.c_void_p()
+    result = runtime.core.wp_cuda_graph_end_capture(device.context, stream.cuda_stream, ctypes.byref(g))
 
     if not result:
         # A concrete error should've already been reported, so we don't need to go into details here
         raise RuntimeError(f"CUDA graph capture failed. {runtime.get_error_string()}")
 
     # set the graph executable
-    graph.graph_exec = graph_exec
+    graph.graph = g
+    graph.graph_exec = None  # Lazy initialization
 
     return graph
+
+
+def capture_debug_dot_print(graph: Graph, path: str, verbose: bool = False):
+    """Export a CUDA graph to a DOT file for visualization
+
+    Args:
+        graph: A :class:`Graph` as returned by :func:`~warp.capture_end()`
+        path: Path to save the DOT file
+        verbose: Whether to include additional debug information in the output
+    """
+    if not runtime.core.wp_capture_debug_dot_print(graph.graph, path.encode(), 0 if verbose else 1):
+        raise RuntimeError(f"Graph debug dot print error: {runtime.get_error_string()}")
+
+
+def assert_conditional_graph_support():
+    if runtime is None:
+        init()
+
+    if runtime.toolkit_version < (12, 4):
+        raise RuntimeError("Warp must be built with CUDA Toolkit 12.4+ to enable conditional graph nodes")
+
+    if runtime.driver_version < (12, 4):
+        raise RuntimeError("Conditional graph nodes require CUDA driver 12.4+")
+
+
+def capture_pause(device: Devicelike = None, stream: Stream | None = None) -> Graph:
+    if stream is not None:
+        device = stream.device
+    else:
+        device = runtime.get_device(device)
+        if not device.is_cuda:
+            raise RuntimeError("Must be a CUDA device")
+        stream = device.stream
+
+    # get the graph being captured
+    graph = device.captures.get(stream)
+
+    if graph is None:
+        raise RuntimeError("Graph capture is not active on this stream")
+
+    _unregister_capture(device, stream, graph)
+
+    g = ctypes.c_void_p()
+    if not runtime.core.wp_cuda_graph_pause_capture(device.context, stream.cuda_stream, ctypes.byref(g)):
+        raise RuntimeError(runtime.get_error_string())
+
+    graph.graph = g
+
+    return graph
+
+
+def capture_resume(graph: Graph, device: Devicelike = None, stream: Stream | None = None):
+    if stream is not None:
+        device = stream.device
+    else:
+        device = runtime.get_device(device)
+        if not device.is_cuda:
+            raise RuntimeError("Must be a CUDA device")
+        stream = device.stream
+
+    if not runtime.core.wp_cuda_graph_resume_capture(device.context, stream.cuda_stream, graph.graph):
+        raise RuntimeError(runtime.get_error_string())
+
+    capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
+    graph.capture_id = capture_id
+
+    _register_capture(device, stream, graph, capture_id)
+
+
+# reusable pinned readback buffer for conditions
+condition_host = None
+
+
+def capture_if(
+    condition: warp.array(dtype=int),
+    on_true: Callable | Graph | None = None,
+    on_false: Callable | Graph | None = None,
+    stream: Stream = None,
+    **kwargs,
+):
+    """Create a dynamic branch based on a condition.
+
+    The condition value is retrieved from the first element of the ``condition`` array.
+
+    This function is particularly useful with CUDA graphs, but can be used without graph capture as well.
+    CUDA 12.4+ is required to take advantage of conditional graph nodes for dynamic control flow.
+
+    Args:
+        condition: Warp array holding the condition value.
+        on_true: A callback function or :class:`Graph` to execute if the condition is True.
+        on_false: A callback function or :class:`Graph` to execute if the condition is False.
+        stream: The CUDA stream where the condition was written. If None, use the current stream on the device where ``condition`` resides.
+
+    Any additional keyword arguments are forwarded to the callback functions.
+    """
+
+    # if neither the IF branch nor the ELSE branch is specified, it's a no-op
+    if on_true is None and on_false is None:
+        return
+
+    # check condition data type
+    if not isinstance(condition, warp.array) or condition.dtype is not warp.int32:
+        raise TypeError("Condition must be a Warp array of int32 with a single element")
+
+    device = condition.device
+
+    # determine the stream and whether a graph capture is active
+    if device.is_cuda:
+        if stream is None:
+            stream = device.stream
+        graph = device.captures.get(stream)
+    else:
+        graph = None
+
+    if graph is None:
+        # if no graph is active, just execute the correct branch directly
+        if device.is_cuda:
+            # use a pinned buffer for condition readback to host
+            global condition_host
+            if condition_host is None:
+                condition_host = warp.empty(1, dtype=int, device="cpu", pinned=True)
+            warp.copy(condition_host, condition, stream=stream)
+            warp.synchronize_stream(stream)
+            condition_value = bool(ctypes.cast(condition_host.ptr, ctypes.POINTER(ctypes.c_int32)).contents)
+        else:
+            condition_value = bool(ctypes.cast(condition.ptr, ctypes.POINTER(ctypes.c_int32)).contents)
+
+        if condition_value:
+            if on_true is not None:
+                if isinstance(on_true, Callable):
+                    on_true(**kwargs)
+                elif isinstance(on_true, Graph):
+                    capture_launch(on_true, stream=stream)
+                else:
+                    raise TypeError("on_true must be a Callable or a Graph")
+        else:
+            if on_false is not None:
+                if isinstance(on_false, Callable):
+                    on_false(**kwargs)
+                elif isinstance(on_false, Graph):
+                    capture_launch(on_false, stream=stream)
+                else:
+                    raise TypeError("on_false must be a Callable or a Graph")
+
+        return
+
+    # ensure conditional graph nodes are supported
+    assert_conditional_graph_support()
+
+    # insert conditional node
+    graph_on_true = ctypes.c_void_p()
+    graph_on_false = ctypes.c_void_p()
+    if not runtime.core.wp_cuda_graph_insert_if_else(
+        device.context,
+        stream.cuda_stream,
+        ctypes.cast(condition.ptr, ctypes.POINTER(ctypes.c_int32)),
+        None if on_true is None else ctypes.byref(graph_on_true),
+        None if on_false is None else ctypes.byref(graph_on_false),
+    ):
+        raise RuntimeError(runtime.get_error_string())
+
+    # pause capturing parent graph
+    main_graph = capture_pause(stream=stream)
+    # store the pointer to the cuda graph to restore it later
+    main_graph_ptr = main_graph.graph
+
+    # capture if-graph
+    if on_true is not None:
+        # temporarily repurpose the main_graph python object such that all dependencies
+        # added through retain_module_exec() end up in the correct python graph object
+        main_graph.graph = graph_on_true
+        capture_resume(main_graph, stream=stream)
+        if isinstance(on_true, Callable):
+            on_true(**kwargs)
+        elif isinstance(on_true, Graph):
+            if not runtime.core.wp_cuda_graph_insert_child_graph(
+                device.context,
+                stream.cuda_stream,
+                on_true.graph,
+            ):
+                raise RuntimeError(runtime.get_error_string())
+        else:
+            raise TypeError("on_true must be a Callable or a Graph")
+        capture_pause(stream=stream)
+
+        # check the if-body graph
+        if not runtime.core.wp_cuda_graph_check_conditional_body(graph_on_true):
+            raise RuntimeError(runtime.get_error_string())
+
+    # capture else-graph
+    if on_false is not None:
+        # temporarily repurpose the main_graph python object such that all dependencies
+        # added through retain_module_exec() end up in the correct python graph object
+        main_graph.graph = graph_on_false
+        capture_resume(main_graph, stream=stream)
+        if isinstance(on_false, Callable):
+            on_false(**kwargs)
+        elif isinstance(on_false, Graph):
+            if not runtime.core.wp_cuda_graph_insert_child_graph(
+                device.context,
+                stream.cuda_stream,
+                on_false.graph,
+            ):
+                raise RuntimeError(runtime.get_error_string())
+        else:
+            raise TypeError("on_false must be a Callable or a Graph")
+        capture_pause(stream=stream)
+
+        # check the else-body graph
+        if not runtime.core.wp_cuda_graph_check_conditional_body(graph_on_false):
+            raise RuntimeError(runtime.get_error_string())
+
+    # restore the main graph to its original state
+    main_graph.graph = main_graph_ptr
+
+    # resume capturing parent graph
+    capture_resume(main_graph, stream=stream)
+
+
+def capture_while(condition: warp.array(dtype=int), while_body: Callable | Graph, stream: Stream = None, **kwargs):
+    """Create a dynamic loop based on a condition.
+
+    The condition value is retrieved from the first element of the ``condition`` array.
+
+    The ``while_body`` callback is responsible for updating the condition value so the loop can terminate.
+
+    This function is particularly useful with CUDA graphs, but can be used without graph capture as well.
+    CUDA 12.4+ is required to take advantage of conditional graph nodes for dynamic control flow.
+
+    Args:
+        condition: Warp array holding the condition value.
+        while_body: A callback function or :class:`Graph` to execute while the loop condition is True.
+        stream: The CUDA stream where the condition was written. If None, use the current stream on the device where ``condition`` resides.
+
+    Any additional keyword arguments are forwarded to the callback function.
+    """
+
+    # check condition data type
+    if not isinstance(condition, warp.array) or condition.dtype is not warp.int32:
+        raise TypeError("Condition must be a Warp array of int32 with a single element")
+
+    device = condition.device
+
+    # determine the stream and whether a graph capture is active
+    if device.is_cuda:
+        if stream is None:
+            stream = device.stream
+        graph = device.captures.get(stream)
+    else:
+        graph = None
+
+    if graph is None:
+        # since no graph is active, just execute the kernels directly
+        while True:
+            if device.is_cuda:
+                # use a pinned buffer for condition readback to host
+                global condition_host
+                if condition_host is None:
+                    condition_host = warp.empty(1, dtype=int, device="cpu", pinned=True)
+                warp.copy(condition_host, condition, stream=stream)
+                warp.synchronize_stream(stream)
+                condition_value = bool(ctypes.cast(condition_host.ptr, ctypes.POINTER(ctypes.c_int32)).contents)
+            else:
+                condition_value = bool(ctypes.cast(condition.ptr, ctypes.POINTER(ctypes.c_int32)).contents)
+
+            if condition_value:
+                if isinstance(while_body, Callable):
+                    while_body(**kwargs)
+                elif isinstance(while_body, Graph):
+                    capture_launch(while_body, stream=stream)
+                else:
+                    raise TypeError("while_body must be a callable or a graph")
+
+            else:
+                break
+
+        return
+
+    # ensure conditional graph nodes are supported
+    assert_conditional_graph_support()
+
+    # insert conditional while-node
+    body_graph = ctypes.c_void_p()
+    cond_handle = ctypes.c_uint64()
+    if not runtime.core.wp_cuda_graph_insert_while(
+        device.context,
+        stream.cuda_stream,
+        ctypes.cast(condition.ptr, ctypes.POINTER(ctypes.c_int32)),
+        ctypes.byref(body_graph),
+        ctypes.byref(cond_handle),
+    ):
+        raise RuntimeError(runtime.get_error_string())
+
+    # pause capturing parent graph and start capturing child graph
+    main_graph = capture_pause(stream=stream)
+    # store the pointer to the cuda graph to restore it later
+    main_graph_ptr = main_graph.graph
+
+    # temporarily repurpose the main_graph python object such that all dependencies
+    # added through retain_module_exec() end up in the correct python graph object
+    main_graph.graph = body_graph
+    capture_resume(main_graph, stream=stream)
+
+    # capture while-body
+    if isinstance(while_body, Callable):
+        while_body(**kwargs)
+    elif isinstance(while_body, Graph):
+        if not runtime.core.wp_cuda_graph_insert_child_graph(
+            device.context,
+            stream.cuda_stream,
+            while_body.graph,
+        ):
+            raise RuntimeError(runtime.get_error_string())
+    else:
+        raise TypeError("while_body must be a callable or a graph")
+
+    # update condition
+    if not runtime.core.wp_cuda_graph_set_condition(
+        device.context,
+        stream.cuda_stream,
+        ctypes.cast(condition.ptr, ctypes.POINTER(ctypes.c_int32)),
+        cond_handle,
+    ):
+        raise RuntimeError(runtime.get_error_string())
+
+    # stop capturing while-body
+    capture_pause(stream=stream)
+
+    # check the while-body graph
+    if not runtime.core.wp_cuda_graph_check_conditional_body(body_graph):
+        raise RuntimeError(runtime.get_error_string())
+
+    # restore the main graph to its original state
+    main_graph.graph = main_graph_ptr
+    capture_resume(main_graph, stream=stream)
 
 
 def capture_launch(graph: Graph, stream: Stream | None = None):
@@ -6282,7 +7248,16 @@ def capture_launch(graph: Graph, stream: Stream | None = None):
         device = graph.device
         stream = device.stream
 
-    if not runtime.core.cuda_graph_launch(graph.graph_exec, stream.cuda_stream):
+    if graph.graph_exec is None:
+        g = ctypes.c_void_p()
+        result = runtime.core.wp_cuda_graph_create_exec(
+            graph.device.context, stream.cuda_stream, graph.graph, ctypes.byref(g)
+        )
+        if not result:
+            raise RuntimeError(f"Graph creation error: {runtime.get_error_string()}")
+        graph.graph_exec = g
+
+    if not runtime.core.wp_cuda_graph_launch(graph.graph_exec, stream.cuda_stream):
         raise RuntimeError(f"Graph launch error: {runtime.get_error_string()}")
 
 
@@ -6393,24 +7368,24 @@ def copy(
         if dest.device.is_cuda:
             if src.device.is_cuda:
                 if src.device == dest.device:
-                    result = runtime.core.memcpy_d2d(
+                    result = runtime.core.wp_memcpy_d2d(
                         dest.device.context, dst_ptr, src_ptr, bytes_to_copy, stream.cuda_stream
                     )
                 else:
-                    result = runtime.core.memcpy_p2p(
+                    result = runtime.core.wp_memcpy_p2p(
                         dest.device.context, dst_ptr, src.device.context, src_ptr, bytes_to_copy, stream.cuda_stream
                     )
             else:
-                result = runtime.core.memcpy_h2d(
+                result = runtime.core.wp_memcpy_h2d(
                     dest.device.context, dst_ptr, src_ptr, bytes_to_copy, stream.cuda_stream
                 )
         else:
             if src.device.is_cuda:
-                result = runtime.core.memcpy_d2h(
+                result = runtime.core.wp_memcpy_d2h(
                     src.device.context, dst_ptr, src_ptr, bytes_to_copy, stream.cuda_stream
                 )
             else:
-                result = runtime.core.memcpy_h2h(dst_ptr, src_ptr, bytes_to_copy)
+                result = runtime.core.wp_memcpy_h2h(dst_ptr, src_ptr, bytes_to_copy)
 
         if not result:
             raise RuntimeError(f"Warp copy error: {runtime.get_error_string()}")
@@ -6445,17 +7420,17 @@ def copy(
             # This work involves a kernel launch, so it must run on the destination device.
             # If the copy stream is different, we need to synchronize it.
             if stream == dest.device.stream:
-                result = runtime.core.array_copy_device(
+                result = runtime.core.wp_array_copy_device(
                     dest.device.context, dst_ptr, src_ptr, dst_type, src_type, src_elem_size
                 )
             else:
                 dest.device.stream.wait_stream(stream)
-                result = runtime.core.array_copy_device(
+                result = runtime.core.wp_array_copy_device(
                     dest.device.context, dst_ptr, src_ptr, dst_type, src_type, src_elem_size
                 )
                 stream.wait_stream(dest.device.stream)
         else:
-            result = runtime.core.array_copy_host(dst_ptr, src_ptr, dst_type, src_type, src_elem_size)
+            result = runtime.core.wp_array_copy_host(dst_ptr, src_ptr, dst_type, src_type, src_elem_size)
 
         if not result:
             raise RuntimeError(f"Warp copy error: {runtime.get_error_string()}")
@@ -6531,22 +7506,60 @@ def type_str(t):
 
         raise TypeError("Invalid vector or matrix dimensions")
     elif get_origin(t) in (list, tuple):
-        args_repr = ", ".join(type_str(x) for x in get_args(t))
-        return f"{t._name}[{args_repr}]"
+        args = get_args(t)
+        if args:
+            args_repr = ", ".join(type_str(x) for x in get_args(t))
+            return f"{t._name}[{args_repr}]"
+        else:
+            return f"{t._name}"
     elif t is Ellipsis:
         return "..."
     elif warp.types.is_tile(t):
-        return "Tile"
+        return f"Tile[{type_str(t.dtype)},{type_str(t.shape)}]"
 
     return t.__name__
 
 
-def print_function(f, file, noentry=False):  # pragma: no cover
+def ctype_ret_str(t):
+    return get_builtin_type(t).__name__
+
+
+def resolve_exported_function_sig(f):
+    if not f.export or f.generic:
+        return None
+
+    # only export simple types that don't use arrays or templated types
+    if not f.is_simple():
+        return None
+
+    # Runtime arguments that are to be passed to the function, not its template signature.
+    if f.export_func is not None:
+        func_args = f.export_func(f.input_types)
+    else:
+        func_args = f.input_types
+
+    # todo: construct a default value for each of the functions args
+    # so we can generate the return type for overloaded functions
+    return_type = f.value_func(func_args, None)
+
+    if return_type is None or (isinstance(return_type, tuple) and len(return_type) > 1):
+        return (func_args, return_type)
+
+    try:
+        ctype_ret_str(return_type)
+    except Exception:
+        return None
+
+    return (func_args, return_type)
+
+
+def print_function(f, file, is_exported, noentry=False):  # pragma: no cover
     """Writes a function definition to a file for use in reST documentation
 
     Args:
         f: The function being written
         file: The file object for output
+        is_exported: Whether the function is available in Python's runtime
         noentry: If True, then the :noindex: and :nocontentsentry: directive
           options will be added
 
@@ -6574,11 +7587,21 @@ def print_function(f, file, noentry=False):  # pragma: no cover
         print("    :nocontentsentry:", file=file)
     print("", file=file)
 
+    print("    .. hlist::", file=file)
+    print("       :columns: 8", file=file)
+    print("", file=file)
+    print("       * Kernel", file=file)
+
+    if is_exported:
+        print("       * Python", file=file)
+
+    if not f.missing_grad:
+        print("       * Differentiable", file=file)
+
+    print("", file=file)
+
     if f.doc != "":
-        if not f.missing_grad:
-            print(f"    {f.doc}", file=file)
-        else:
-            print(f"    {f.doc} [1]_", file=file)
+        print(f"    {f.doc}", file=file)
         print("", file=file)
 
     print(file=file)
@@ -6594,8 +7617,10 @@ def export_functions_rst(file):  # pragma: no cover
         ".. functions:\n"
         ".. currentmodule:: warp\n"
         "\n"
-        "Kernel Reference\n"
-        "================"
+        "Built-Ins Reference\n"
+        "===================\n"
+        "This section lists the Warp types and functions available to use from Warp kernels and optionally also from the Warp Python runtime API.\n"
+        "For a listing of the API that is exclusively intended to be used at the *Python Scope* and run inside the CPython interpreter, see the :doc:`runtime` section.\n"
     )
 
     print(header, file=file)
@@ -6640,9 +7665,12 @@ def export_functions_rst(file):  # pragma: no cover
         if hasattr(f, "overloads"):
             # append all overloads to the group
             for o in f.overloads:
-                groups[f.group].append(o)
+                sig = resolve_exported_function_sig(f)
+                is_exported = sig is not None
+                groups[f.group].append((o, is_exported))
         else:
-            groups[f.group].append(f)
+            is_exported = False
+            groups[f.group].append((f, is_exported))
 
     # Keep track of what function and query types have been written
     written_functions = set()
@@ -6661,27 +7689,28 @@ def export_functions_rst(file):  # pragma: no cover
         print(k, file=file)
         print("---------------", file=file)
 
-        for f in g:
+        for f, is_exported in g:
+            if not isinstance(f, Function) and callable(f):
+                # f is a plain Python function
+                print(f".. autofunction:: {f.__module__}.{f.__name__}", file=file)
+                continue
             if f.func:
                 # f is a Warp function written in Python, we can use autofunction
                 print(f".. autofunction:: {f.func.__module__}.{f.key}", file=file)
                 continue
             for f_prefix, query_type in query_types:
                 if f.key.startswith(f_prefix) and query_type not in written_query_types:
-                    print(f".. autoclass:: {query_type}", file=file)
+                    print(f".. autoclass:: warp.{query_type}", file=file)
+                    print("   :exclude-members: Var, vars", file=file)
                     written_query_types.add(query_type)
                     break
 
             if f.key in written_functions:
                 # Add :noindex: + :nocontentsentry: since Sphinx gets confused
-                print_function(f, file=file, noentry=True)
+                print_function(f, file, is_exported, noentry=True)
             else:
-                if print_function(f, file=file):
+                if print_function(f, file, is_exported):
                     written_functions.add(f.key)
-
-    # footnotes
-    print(".. rubric:: Footnotes", file=file)
-    print(".. [1] Function gradients have not been implemented for backpropagation.", file=file)
 
 
 def export_stubs(file):  # pragma: no cover
@@ -6706,7 +7735,6 @@ def export_stubs(file):  # pragma: no cover
 """,
         file=file,
     )
-
     print(
         "# Autogenerated file, do not edit, this file provides stubs for builtins autocomplete in VSCode, PyCharm, etc",
         file=file,
@@ -6725,6 +7753,7 @@ def export_stubs(file):  # pragma: no cover
     print('Rows = TypeVar("Rows", bound=int)', file=file)
     print('Cols = TypeVar("Cols", bound=int)', file=file)
     print('DType = TypeVar("DType")', file=file)
+    print('Shape = TypeVar("Shape")', file=file)
 
     print("Vector = Generic[Length, Scalar]", file=file)
     print("Matrix = Generic[Rows, Cols, Scalar]", file=file)
@@ -6733,6 +7762,7 @@ def export_stubs(file):  # pragma: no cover
     print("Array = Generic[DType]", file=file)
     print("FabricArray = Generic[DType]", file=file)
     print("IndexedFabricArray = Generic[DType]", file=file)
+    print("Tile = Generic[DType, Shape]", file=file)
 
     # prepend __init__.py
     with open(os.path.join(os.path.dirname(file.name), "__init__.py")) as header_file:
@@ -6767,7 +7797,7 @@ def export_stubs(file):  # pragma: no cover
         if hasattr(g, "overloads"):
             for f in g.overloads:
                 add_stub(f)
-        else:
+        elif isinstance(g, Function):
             add_stub(g)
 
 
@@ -6782,9 +7812,6 @@ def export_builtins(file: io.TextIOBase):  # pragma: no cover
         else:
             return t.__name__
 
-    def ctype_ret_str(t):
-        return get_builtin_type(t).__name__
-
     file.write("namespace wp {\n\n")
     file.write('extern "C" {\n\n')
 
@@ -6792,23 +7819,11 @@ def export_builtins(file: io.TextIOBase):  # pragma: no cover
         if not hasattr(g, "overloads"):
             continue
         for f in g.overloads:
-            if not f.export or f.generic:
+            sig = resolve_exported_function_sig(f)
+            if sig is None:
                 continue
 
-            # only export simple types that don't use arrays
-            # or templated types
-            if not f.is_simple():
-                continue
-
-            # Runtime arguments that are to be passed to the function, not its template signature.
-            if f.export_func is not None:
-                func_args = f.export_func(f.input_types)
-            else:
-                func_args = f.input_types
-
-            # todo: construct a default value for each of the functions args
-            # so we can generate the return type for overloaded functions
-            return_type = f.value_func(func_args, None)
+            func_args, return_type = sig
 
             args = ", ".join(f"{ctype_arg_str(v)} {k}" for k, v in func_args.items())
             params = ", ".join(func_args.keys())
@@ -6830,11 +7845,7 @@ def export_builtins(file: io.TextIOBase):  # pragma: no cover
                     )
             else:
                 # single return value function
-                try:
-                    return_str = ctype_ret_str(return_type)
-                except Exception:
-                    continue
-
+                return_str = ctype_ret_str(return_type)
                 if args:
                     file.write(
                         f"WP_API void {f.mangled_name}({args}, {return_str}* ret) {{ *ret = wp::{f.key}({params}); }}\n"

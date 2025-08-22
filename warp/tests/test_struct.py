@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc  # Added for garbage collection tests
 import unittest
 from typing import Any
 
@@ -234,6 +235,44 @@ def test_nested_struct(test, device):
     )
 
 
+@wp.struct
+class MatStruct:
+    m: wp.mat44
+
+
+@wp.kernel
+def kernel_nested_mat(out: wp.array(dtype=wp.mat44)):
+    s = MatStruct()
+    m = wp.mat44()
+
+    s.m[1, 2] = 3.0
+
+    out[0] = s.m
+
+
+def test_nested_mat(test, device):
+    m = wp.array([wp.mat44()], dtype=wp.mat44, device=device)
+    wp.launch(kernel_nested_mat, dim=1, outputs=[m], device=device)
+    wp.synchronize()
+
+    out = m.numpy()
+    assert_np_equal(out[0][1, 2], 3.0)
+
+
+def test_assign_view(test, device):
+    @wp.kernel
+    def kernel_assign_view(out: wp.array2d(dtype=wp.mat44)):
+        out[0][2, 2] = 6.0
+
+    m = wp.array([[wp.mat44()]], dtype=wp.mat44, device=device)
+
+    with test.assertRaisesRegex(
+        wp.codegen.WarpCodegenError,
+        r"Incorrect number of indices specified for array indexing",
+    ):
+        wp.launch(kernel_assign_view, dim=[1, 1], outputs=[m], device=device)
+
+
 def test_struct_attribute_error(test, device):
     @wp.kernel
     def kernel(foo: Foo):
@@ -246,6 +285,18 @@ def test_struct_attribute_error(test, device):
             inputs=[Foo()],
             device=device,
         )
+
+
+def test_struct_inheritance_error(test, device):
+    with test.assertRaisesRegex(RuntimeError, r"Warp structs must be defined as base classes$"):
+
+        @wp.struct
+        class Parent:
+            x: int
+
+        @wp.struct
+        class Child(Parent):
+            y: int
 
 
 @wp.kernel
@@ -648,7 +699,94 @@ def test_struct_array_hash(test, device):
     )
 
 
-devices = get_test_devices()
+# Tests for garbage collection behavior with arrays in structs
+@wp.struct
+class StructWithArray:
+    data: wp.array(dtype=float)
+    some_value: int
+
+
+@wp.kernel
+def access_array_kernel(s: StructWithArray, out: wp.array(dtype=float)):
+    # This kernel is used to verify data integrity by reading the first element.
+    # Assumes s.data has at least 1 element for this test.
+    out[0] = s.data[0]
+
+
+@wp.kernel
+def compute_loss_from_struct_array_kernel(s_in: StructWithArray, loss_val: wp.array(dtype=float)):
+    # Compute a simple scalar loss from the array elements for grad testing.
+    # Assumes s_in.data has at least 2 elements for this test.
+    res = 0.0
+    res += s_in.data[0] * 2.0  # Example weight
+    res += s_in.data[1] * 3.0  # Example weight
+    loss_val[0] = res
+
+
+def test_struct_array_gc_direct_assignment(test, device):
+    """
+    Tests that an array assigned to a struct (with no other direct Python
+    references) is not garbage collected prematurely.
+    """
+    wp.init()
+
+    s = StructWithArray()
+    s.some_value = 20
+
+    # Create an array, then assign it to the struct.
+    # After this assignment, 's.data' is the primary way to access it from
+    # Python's perspective, though Warp's context should also hold a reference.
+    local_array = wp.array([4.0, 5.0, 6.0], dtype=float, device=device)
+    s.data = local_array
+    del local_array  # Remove the direct Python reference
+
+    # Force garbage collection
+    gc.collect()
+
+    # Attempt to access the array in a kernel
+    out_wp = wp.zeros(1, dtype=float, device=device)
+    try:
+        wp.launch(kernel=access_array_kernel, dim=1, inputs=[s, out_wp], device=device)
+
+        # We expect to read 4.0 if the array is still valid
+        assert out_wp.numpy()[0] == 4.0, "Array data was not accessible or incorrect after GC with direct assignment."
+    except Exception as e:
+        test.fail(f"Kernel execution failed after GC with direct assignment: {e}")
+
+
+def test_struct_array_gc_requires_grad_toggle(test, device):
+    """
+    Tests that an array within a struct is not garbage collected prematurely
+    when its requires_grad flag is toggled, and that backward pass works.
+    """
+    wp.init()
+
+    s = StructWithArray()
+    s.some_value = 10
+    # Initialize array with requires_grad=True. Content: [1.0, 2.0, 3.0]
+    s.data = wp.array([1.0, 2.0, 3.0], dtype=float, device=device, requires_grad=True)
+
+    loss_wp = wp.zeros(1, dtype=float, device=device, requires_grad=True)
+
+    tape = wp.Tape()
+    with tape:
+        # Launch kernel that uses s.data to compute a loss
+        wp.launch(
+            kernel=compute_loss_from_struct_array_kernel,
+            dim=1,
+            inputs=[s, loss_wp],
+            device=device,
+        )
+
+    # Expected loss = 1.0*2.0 + 2.0*3.0 = 2.0 + 6.0 = 8.0
+
+    # After the forward pass is recorded, toggle requires_grad and run GC
+    s.data.requires_grad = False
+    gc.collect()
+
+    # will cause a memory access violation if grad array has been garbage collected
+    # or struct is not updated correctly
+    tape.backward(loss=loss_wp)
 
 
 class TestStruct(unittest.TestCase):
@@ -665,8 +803,11 @@ class TestStruct(unittest.TestCase):
         v.value[2] = 3.0
 
         arr = wp.array([v], dtype=VecStruct)
-        expected = np.array(([1.0, 2.0, 3.0],))
-        assert np.all(arr.numpy().tolist() == expected)
+        expected = np.array([[[1.0, 2.0, 3.0]]])
+        np.testing.assert_equal(arr.numpy().tolist(), expected)
+
+
+devices = get_test_devices()
 
 
 add_function_test(TestStruct, "test_step", test_step, devices=devices)
@@ -682,6 +823,10 @@ add_kernel_test(
 )
 add_kernel_test(TestStruct, kernel=test_return, name="test_return", dim=1, inputs=[], devices=devices)
 add_function_test(TestStruct, "test_nested_struct", test_nested_struct, devices=devices)
+add_function_test(TestStruct, "test_nested_mat", test_nested_mat, devices=devices)
+add_function_test(TestStruct, "test_assign_view", test_assign_view, devices=devices)
+add_function_test(TestStruct, "test_struct_attribute_error", test_struct_attribute_error, devices=devices)
+add_function_test(TestStruct, "test_struct_inheritance_error", test_struct_inheritance_error, devices=devices)
 add_function_test(TestStruct, "test_nested_array_struct", test_nested_array_struct, devices=devices)
 add_function_test(TestStruct, "test_convert_to_device", test_convert_to_device, devices=devices)
 add_function_test(TestStruct, "test_nested_empty_struct", test_nested_empty_struct, devices=devices)
@@ -732,6 +877,12 @@ add_kernel_test(
 )
 
 add_function_test(TestStruct, "test_struct_array_hash", test_struct_array_hash, devices=None)
+add_function_test(
+    TestStruct, "test_struct_array_gc_requires_grad_toggle", test_struct_array_gc_requires_grad_toggle, devices=devices
+)
+add_function_test(
+    TestStruct, "test_struct_array_gc_direct_assignment", test_struct_array_gc_direct_assignment, devices=devices
+)
 
 
 if __name__ == "__main__":

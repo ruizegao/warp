@@ -54,17 +54,18 @@ Changelog = "https://github.com/NVIDIA/warp/blob/main/CHANGELOG.md"
 docs = [
     'nvidia-sphinx-theme; python_version >= "3.9"',
     "sphinx-copybutton",
-    "ruff == 0.11.5",
+    "ruff == 0.11.10",
     "myst_parser",
 ]
 dev = [
     "pre-commit",
-    "ruff == 0.11.5",
+    "ruff == 0.11.10",
     "nvtx",
     'nvidia-sphinx-theme; python_version >= "3.9"',
     "sphinx-copybutton",
     "coverage[toml]",
 ]
+benchmark = ["usd-core ; platform_machine != 'aarch64'"]
 extras = ['usd-core', 'matplotlib', 'pillow', 'pyglet']
 
 [tool.setuptools.packages.find]
@@ -83,7 +84,7 @@ extend-exclude = [
     "warp/thirdparty/appdirs.py",
     "warp/thirdparty/dlpack.py",
     "tools",
-    "stubs.py",
+    "__init__.pyi",
 ]
 
 [tool.ruff.lint]
@@ -114,7 +115,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["F401"]
+"__init__.py" = ["F401", "PLC0414"]
 "warp/tests/*.py" = ["F841"]
 "asv/benchmarks/**.py" = ["RUF012"]
 
@@ -154,5 +155,5 @@ omit = [
     "render_opengl.py",
     "build_dll.py",
     "config.py",
-    "stubs.py",
+    "__init__.pyi",
 ]

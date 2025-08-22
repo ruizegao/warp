@@ -153,12 +153,31 @@ copy the array back to CPU memory where it is passed to NumPy.
 Calling :func:`array.numpy` on a CPU array will return a zero-copy NumPy view
 onto the Warp data.
 
+Common operators such as ``+``, ``-``, ``*``, and ``/`` are overloaded for Warp arrays.
+For example, we can add two arrays together using the ``+`` operator:
+
+.. testcode::
+
+    a = wp.array(np.arange(10), dtype=wp.float32)
+    b = wp.array(np.arange(10), dtype=wp.float32)
+    # multiply a by 2 and add these two arrays together element-wise
+    c = 2.0 * a + b
+    # multiply c by 10.0 in-place
+    c *= 10.0
+    print(c)
+
+.. testoutput::
+
+    [  0.  30.  60.  90. 120. 150. 180. 210. 240. 270.]
+
+For further details on mapping arbitrary functions to Warp arrays, see :func:`warp.utils.map`.
+
 Please see the :ref:`Arrays Reference <Arrays>` for more details.
 
 User Functions
 --------------
 
-Users can write their own functions using the ``@wp.func`` decorator, for example::
+Users can write their own functions to be called from Warp kernels using the ``@wp.func`` decorator, for example::
 
     @wp.func
     def square(x: float):
@@ -166,6 +185,13 @@ Users can write their own functions using the ``@wp.func`` decorator, for exampl
 
 Kernels can call user functions defined in the same module or defined in a different module.
 As the example shows, return type hints for user functions are **optional**.
+
+While ``@wp.func`` is primarily for functions that are called from kernels, they can also be called directly
+from Python. This is an experimental feature with an important distinction: functions called from kernels are compiled by Warp,
+while functions called from Python are executed by the native Python interpreter.
+This means that any code inside a ``@wp.func`` that is intended to be called from Python must be
+compatible with the standard Python interpreter (e.g., it cannot use Warp's tile API).
+See :ref:`Python Scope vs. Kernel Scope API <python-scope-vs-kernel-scope-api>` for more details.
 
 Anything that can be done in a Warp kernel can also be done in a user function **with the exception**
 of :func:`wp.tid() <tid>`. The thread index can be passed in through the arguments of a user function if it is required.
@@ -210,6 +236,25 @@ User functions may also be overloaded by defining multiple function signatures w
     def custom(x: wp.vec3):
         return x + wp.vec3(1.0, 0.0, 0.0)
 
+Tiles may also be passed to user functions. The function signature tile argument should include
+dtype, shape, and storage parameters to match the tile type intended to be used in the function. For example:
+
+.. code-block:: python
+
+    @wp.func
+    def tile_sum_func(a: wp.tile(dtype=float, shape=(TILE_M, TILE_N), storage="shared")):
+        return wp.tile_sum(a) * 0.5
+
+If the tile is non-contiguous (e.g. if the tile is transposed), the tile strides parameter should also be provided.
+For convenience, it is recommended that users rely on `typing.Any` to let the compiler automatically
+determine the tile argument type:
+
+.. code-block:: python
+
+    @wp.func
+    def tile_sum_func(a: Any):
+        return wp.tile_sum(a) * 0.5
+
 See :ref:`Generic Functions` for details on using ``typing.Any`` in user function signatures.
 
 See :doc:`modules/differentiability` for details on how to define custom gradient functions,
@@ -233,6 +278,7 @@ As with kernel parameters, all attributes of a struct must have valid type hints
 Structs may be used as a ``dtype`` for ``wp.arrays`` and may be passed to kernels directly as arguments.
 See :ref:`Structs Reference <Structs>` for more details on structs.
 
+.. _python-scope-vs-kernel-scope-api:
 
 Python Scope vs. Kernel Scope API
 ---------------------------------

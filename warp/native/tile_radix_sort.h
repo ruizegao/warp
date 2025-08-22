@@ -29,7 +29,7 @@ namespace wp
 {
 
 
-// After this threashold, using segmented_sort from cub is faster
+// After this threshold, using segmented_sort from cub is faster
 // The threshold must be a power of 2
 // The radix sort in this file is consistently slower than the bitonic sort
 #define BITONIC_SORT_THRESHOLD 2048
@@ -122,7 +122,7 @@ inline CUDA_CALLABLE void bitonic_sort_single_stage_full_thread_block(int k, uns
         int thread_id2 = loop_id * WP_TILE_BLOCK_DIM + thread_id;
 
         key_register[loop_id] = thread_id2 < length ? key_sh_mem[thread_id2] : max_key_value;
-        val_register[loop_id] = thread_id2 < length ? val_sh_mem[thread_id2] : 0;        
+        val_register[loop_id] = thread_id2 < length ? val_sh_mem[thread_id2] : static_cast<V>(0);        
     }
     
     __syncthreads();
@@ -342,7 +342,11 @@ inline CUDA_CALLABLE void bitonic_sort_thread_block_shared_mem(
                 values_shared_mem[i] = values_input[i];
             }
             else
+            {
+                // Note that these values may end up in the output If enough NaN or Inf values are present in keys_input
                 keys_shared_mem[i] = key_max_possible_value;
+                values_shared_mem[i] = static_cast<V>(0);
+            }
         }
         __syncthreads();
 

@@ -115,8 +115,12 @@ Shared Memory Tiles
 
 Some operations like matrix multiplication require access to an entire tile of values.
 In this case, the tile data may be stored in shared memory, which allows efficient random access.
-Warp will automatically migrate tiles to shared memory as necessary for specific operations.
-Shared memory is a limited resource, and so the tile size must be set appropriately to avoid exceeding the hardware limitations.
+Warp will automatically migrate tiles to shared memory as necessary for specific operations, some of which
+require thread synchronization. For instance, when writing to a tile element, (e.g. ``tile[row, col] = val``),
+Warp does not a priori know if the current thread is assigned to ``(row, col)``, so the tile is stored in shared
+memory to allow random accessing. A thread synchronization must also follow, to prevent downstream race conditions.
+
+Note that shared memory is a limited resource, and so the tile size must be set appropriately to avoid exceeding the hardware limitations.
 Otherwise, kernel compilation may fail.
 
 Example: General Matrix Multiply (GEMM)
@@ -202,6 +206,9 @@ Construction
 * :func:`untile`
 * :func:`tile_view`
 * :func:`tile_broadcast`
+* :func:`tile_reshape`
+* :func:`tile_squeeze`
+* :func:`tile_astype`
 
 Load/Store
 ^^^^^^^^^^
@@ -265,6 +272,50 @@ From here, the tile can be used in other regular cooperative operations such as 
 Similarly, we can `untile` tile objects back to their per-thread scalar equivalent values.
 
 .. Note:: All threads in a block must execute tile operations, but code surrounding tile operations may contain arbitrary conditional logic.
+
+Type Preservation
+^^^^^^^^^^^^^^^^^
+
+:func:`warp.tile` includes the optional parameter ``preserve_type``, which is ``False`` by default.
+When ``preserve_type`` is ``False``, this function expands non-scalar inputs into a multi-dimensional tile.
+Vectors are expanded into a 2D tile of scalar values with shape ``(length(vector), block_dim)``,
+while matrices are expanded into a 3D tile of scalar values with shape ``(rows, cols, block_dim)``.
+
+When ``preserve_type`` is ``True``, this function outputs a 1D tile of length ``block_dim`` with the same
+data type as the input value. So if you tile a vector across the block with ``preserve_type=True``, a 1D
+tile of vectors will be returned. This is useful for collective operations that operate on the entire
+vector or matrix rather than their individual components, as in the following example demonstrating
+a matrix tile reduction:
+
+.. testcode::
+    :skipif: wp.get_device() == "cpu" or wp.get_cuda_device_count() == 0
+
+    import warp as wp
+
+    TILE_DIM = 32
+
+    @wp.kernel
+    def matrix_reduction_kernel(y: wp.array(dtype=wp.mat33)):
+        i = wp.tid()
+        I = wp.identity(3, dtype=wp.float32)
+        m = wp.float32(i) * I
+
+        t = wp.tile(m, preserve_type=True)
+        sum = wp.tile_reduce(wp.add, t)
+
+        wp.tile_store(y, sum)
+
+    y = wp.zeros(shape=1, dtype=wp.mat33)
+
+    wp.launch(matrix_reduction_kernel, dim=TILE_DIM, inputs=[], outputs=[y], block_dim=TILE_DIM)
+
+    print(y.numpy()[0])
+
+.. testoutput::
+
+    [[496.   0.   0.]
+     [  0. 496.   0.]
+     [  0.   0. 496.]]
 
 Example: Using tiles to accelerate array-wide reductions
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -349,6 +400,20 @@ Please see the :ref:`differentiability` section for more details.
 
 .. _mathdx:
 
+``Failed to compile LTO`` Error Message
+---------------------------------------
+
+Some tile operations invoke MathDx APIs to generate and compile link-time objects (LTOs) at runtime.
+If the compilation fails, you may see an error message that mentions ``Failed to compile LTO``.
+A common cause of this error is that the tile sizes involved are too large for the current device, as shared memory
+is a limited resource.
+
+To get more information about the error, you can set the ``LIBMATHDX_LOG_LEVEL`` environment
+variable to 5 and rerun the program. Batching the problem into smaller tiles may be required to work around the shared
+memory limitations.
+In the case of FFT operations, using more threads per block may help (see the
+`cuFFTDx requirements <https://docs.nvidia.com/cuda/cufftdx/requirements_func.html>`__ for more details).
+
 Building with MathDx
 --------------------
 
@@ -360,5 +425,9 @@ When building Warp locally using ``build_lib.py``, the script will attempt to au
 from the `cuBLASDx Downloads Page <https://developer.nvidia.com/cublasdx-downloads>`__.
 A path to an existing ``libmathdx`` installation can also be specified using the ``--libmathdx_path`` option
 when running ``build_lib.py`` or by defining the path in the ``LIBMATHDX_HOME`` environment variable.
+
+Please note that CUDA Toolkit 12.6.3 or higher is required for full MathDx support when building Warp from source.
+Warp + MathDx will compile with earlier CUDA 12 versions, but matrix multiplication, triangular solves, Cholesky factorization,
+and the Cholesky solver will fail at runtime.
 
 .. [1] `Technical Blog: Introducing Tile-Based Programming in Warp 1.5.0 <https://developer.nvidia.com/blog/introducing-tile-based-programming-in-warp-1-5-0/>`_

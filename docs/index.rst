@@ -28,8 +28,8 @@ and USD-related features.
 The binaries hosted on PyPI are currently built with the CUDA 12 runtime and therefore
 require a minimum version of the CUDA driver of 525.60.13 (Linux x86-64) or 528.33 (Windows x86-64).
 
-If you require GPU support on a system with an older CUDA driver, you can build Warp from source or
-install wheels built with the CUDA 11.8 runtime as described in :ref:`GitHub Installation`.
+If you require a version of Warp built with the CUDA 13 runtime, you can build Warp from source or
+install wheels built with the CUDA 13.0 runtime as described in :ref:`GitHub Installation`.
 
 Basic Example
 -------------
@@ -154,18 +154,30 @@ warp/examples/fem
       - mixed elasticity
       - apic fluid
       - streamlines
-    * - .. image:: ./img/examples/fem_convection_diffusion.png
-           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_convection_diffusion.py
+    * - .. image:: ./img/examples/fem_distortion_energy.png
+           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_distortion_energy.py
       - .. image:: ./img/examples/fem_navier_stokes.png
            :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_navier_stokes.py
       - .. image:: ./img/examples/fem_burgers.png
            :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_burgers.py
       - .. image:: ./img/examples/fem_magnetostatics.png
            :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_magnetostatics.py
-    * - convection diffusion
+    * - distortion energy
       - navier stokes
       - burgers
       - magnetostatics
+    * - .. image:: ./img/examples/fem_adaptive_grid.png
+           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_adaptive_grid.py
+      - .. image:: ./img/examples/fem_nonconforming_contact.png
+           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_nonconforming_contact.py
+      - .. image:: ./img/examples/fem_darcy_ls_optimization.png
+           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_darcy_ls_optimization.py
+      - .. image:: ./img/examples/fem_elastic_shape_optimization.png
+           :target: https://github.com/NVIDIA/warp/tree/main/warp/examples/fem/example_elastic_shape_optimization.py
+    * - adaptive grid
+      - nonconforming contact
+      - darcy level-set optimization
+      - elastic shape optimization
 
 warp/examples/optim
 ^^^^^^^^^^^^^^^^^^^
@@ -360,20 +372,28 @@ Contributing
 Contributions and pull requests from the community are welcome.
 Please see the :doc:`modules/contribution_guide` for more information on contributing to the development of Warp.
 
-Citing
-------
+Publications & Citation
+-----------------------
+
+Research Using Warp
+^^^^^^^^^^^^^^^^^^^
+:doc:`/publications` lists academic and research publications that leverage the capabilities of Warp.
+We encourage you to add your own published work using Warp to this list.
+
+Citing Warp
+^^^^^^^^^^^
 
 If you use Warp in your research, please use the following citation:
 
 .. code:: bibtex
 
     @misc{warp2022,
-        title= {Warp: A High-performance Python Framework for GPU Simulation and Graphics},
-        author = {Miles Macklin},
-        month = {March},
-        year = {2022},
-        note= {NVIDIA GPU Technology Conference (GTC)},
-        howpublished = {\url{https://github.com/nvidia/warp}}
+      title        = {Warp: A High-performance Python Framework for GPU Simulation and Graphics},
+      author       = {Miles Macklin},
+      month        = {March},
+      year         = {2022},
+      note         = {NVIDIA GPU Technology Conference (GTC)},
+      howpublished = {\url{https://github.com/nvidia/warp}}
     }
 
 Full Table of Contents
@@ -394,6 +414,7 @@ Full Table of Contents
     debugging
     limitations
     modules/contribution_guide
+    publications
     faq
     changelog
 

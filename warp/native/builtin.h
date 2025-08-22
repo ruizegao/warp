@@ -49,7 +49,7 @@
 #define DEG_TO_RAD  0.01745329251994329577
 
 #if defined(__CUDACC__) && !defined(_MSC_VER)
-__device__ void __debugbreak() {}
+__device__ void __debugbreak() { __brkpt(); }
 #endif
 
 #if defined(__clang__) && defined(__CUDA__) && defined(__CUDA_ARCH__)
@@ -197,19 +197,19 @@ CUDA_CALLABLE inline float half_to_float(half h)
 
 #else  // Native C++ for Warp builtins outside of kernels
 
-extern "C" WP_API uint16_t float_to_half_bits(float x);
-extern "C" WP_API float half_bits_to_float(uint16_t u);
+extern "C" WP_API uint16_t wp_float_to_half_bits(float x);
+extern "C" WP_API float wp_half_bits_to_float(uint16_t u);
 
 inline half float_to_half(float x)
 {
     half h;
-    h.u = float_to_half_bits(x);
+    h.u = wp_float_to_half_bits(x);
     return h;
 }
 
 inline float half_to_float(half h)
 {
-   return half_bits_to_float(h.u);
+   return wp_half_bits_to_float(h.u);
 }
 
 #endif
@@ -268,16 +268,20 @@ inline CUDA_CALLABLE half operator / (half a,half b)
 
 
 template <typename T>
-CUDA_CALLABLE float cast_float(T x) { return (float)(x); }
+CUDA_CALLABLE inline float cast_float(T x) { return (float)(x); }
 
 template <typename T>
-CUDA_CALLABLE int cast_int(T x) { return (int)(x); }
+CUDA_CALLABLE inline int cast_int(T x) { return (int)(x); }
 
 template <typename T>
-CUDA_CALLABLE void adj_cast_float(T x, T& adj_x, float adj_ret) { adj_x += T(adj_ret); }
+CUDA_CALLABLE inline void adj_cast_float(T x, T& adj_x, float adj_ret) {}
+
+CUDA_CALLABLE inline void adj_cast_float(float16 x, float16& adj_x, float adj_ret) { adj_x += float16(adj_ret); }
+CUDA_CALLABLE inline void adj_cast_float(float32 x, float32& adj_x, float adj_ret) { adj_x += float32(adj_ret); }
+CUDA_CALLABLE inline void adj_cast_float(float64 x, float64& adj_x, float adj_ret) { adj_x += float64(adj_ret); }
 
 template <typename T>
-CUDA_CALLABLE void adj_cast_int(T x, T& adj_x, int adj_ret) { adj_x += adj_ret; }
+CUDA_CALLABLE inline void adj_cast_int(T x, T& adj_x, int adj_ret) {}
 
 template <typename T>
 CUDA_CALLABLE inline void adj_int8(T, T&, int8) {}
@@ -1226,6 +1230,15 @@ inline CUDA_CALLABLE launch_coord_t launch_coord(size_t linear, const launch_bou
     return coord;
 }
 
+inline CUDA_CALLABLE int block_dim()
+{
+#if defined(__CUDA_ARCH__)
+    return blockDim.x;
+#else
+    return 1;
+#endif
+}
+
 inline CUDA_CALLABLE int tid(size_t index, const launch_bounds_t& bounds)
 {
     // For the 1-D tid() we need to warn the user if we're about to provide a truncated index
@@ -1264,6 +1277,83 @@ inline CUDA_CALLABLE_DEVICE void tid(int& i, int& j, int& k, int& l, size_t inde
     l = c.l;
 }
 
+// should match types.py
+constexpr int SLICE_BEGIN = (1U << (sizeof(int) - 1)) - 1; // std::numeric_limits<int>::max()
+constexpr int SLICE_END = -(1U << (sizeof(int) - 1)); // std::numeric_limits<int>::min()
+
+struct slice_t
+{
+    int start;
+    int stop;
+    int step;
+
+    CUDA_CALLABLE inline slice_t()
+        : start(SLICE_BEGIN), stop(SLICE_END), step(1)
+    {}
+
+    CUDA_CALLABLE inline slice_t(int start, int stop, int step)
+        : start(start), stop(stop), step(step)
+    {}
+};
+
+CUDA_CALLABLE inline slice_t slice_adjust_indices(const slice_t& slice, int length)
+{
+#ifndef NDEBUG
+    if (slice.step == 0)
+    {
+        printf("%s:%d slice step cannot be 0\n", __FILE__, __LINE__);
+        assert(0);
+    }
+#endif
+
+    int start, stop;
+
+    if (slice.start == SLICE_BEGIN)
+    {
+        start = slice.step < 0 ? length - 1 : 0;
+    }
+    else
+    {
+        start = min(max(slice.start, -length), length);
+        start = start < 0 ? start + length : start;
+    }
+
+    if (slice.stop == SLICE_END)
+    {
+        stop = slice.step < 0 ? -1 : length;
+    }
+    else
+    {
+        stop = min(max(slice.stop, -length), length);
+        stop = stop < 0 ? stop + length : stop;
+    }
+
+    return {start, stop, slice.step};
+}
+
+CUDA_CALLABLE inline int slice_get_length(const slice_t& slice)
+{
+#ifndef NDEBUG
+    if (slice.step == 0)
+    {
+        printf("%s:%d slice step cannot be 0\n", __FILE__, __LINE__);
+        assert(0);
+    }
+#endif
+
+    if (slice.step > 0 && slice.start < slice.stop)
+    {
+        return 1 + (slice.stop - slice.start - 1) / slice.step;
+    }
+
+    if (slice.step < 0 && slice.start > slice.stop)
+    {
+        return 1 + (slice.start - slice.stop - 1) / (-slice.step);
+    }
+
+    return 0;
+}
+
 template<typename T>
 inline CUDA_CALLABLE T atomic_add(T* buf, T value)
 {
@@ -1273,6 +1363,29 @@ inline CUDA_CALLABLE T atomic_add(T* buf, T value)
     return old;
 #else
     return atomicAdd(buf, value);
+#endif
+}
+
+// emulate atomic int64 add with atomicCAS()
+template <>
+inline CUDA_CALLABLE int64 atomic_add(int64* address, int64 val)
+{
+#if defined(__CUDA_ARCH__)
+    unsigned long long int *address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+
+    while (val < (int64)old)
+    {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed, (int64)val);
+    }
+
+    return (int64)old;
+
+#else
+    int64 old = *address;
+    *address = min(old, val);
+    return old;
 #endif
 }
 
@@ -1312,53 +1425,6 @@ inline CUDA_CALLABLE float16 atomic_add(float16* buf, float16 value)
         return float16(0.0f);
     #endif
 #endif
-
-}
-
-// emulate atomic float max with atomicCAS()
-inline CUDA_CALLABLE float atomic_max(float* address, float val)
-{
-#if defined(__CUDA_ARCH__)
-    int *address_as_int = (int*)address;
-    int old = *address_as_int, assumed;
-    
-	while (val > __int_as_float(old))
-	{
-        assumed = old;
-        old = atomicCAS(address_as_int, assumed,
-                        __float_as_int(val));
-    }
-
-    return __int_as_float(old);
-
-#else
-    float old = *address;
-    *address = max(old, val);
-    return old;
-#endif
-}
-
-// emulate atomic float min with atomicCAS()
-inline CUDA_CALLABLE float atomic_min(float* address, float val)
-{
-#if defined(__CUDA_ARCH__)
-    int *address_as_int = (int*)address;
-    int old = *address_as_int, assumed;
-
-    while (val < __int_as_float(old)) 
-	{
-        assumed = old;
-        old = atomicCAS(address_as_int, assumed,
-                        __float_as_int(val));
-    }
-
-    return __int_as_float(old);
-
-#else
-    float old = *address;
-    *address = min(old, val);
-    return old;
-#endif
 }
 
 template<>
@@ -1394,33 +1460,47 @@ inline CUDA_CALLABLE float64 atomic_add(float64* buf, float64 value)
     #undef __PTR
 
 #endif  // CUDA compiled by NVRTC
-
 }
 
-// emulate atomic double max with atomicCAS()
-inline CUDA_CALLABLE double atomic_max(double* address, double val)
+template <typename T>
+inline CUDA_CALLABLE T atomic_min(T* address, T val)
 {
 #if defined(__CUDA_ARCH__)
-        unsigned long long int *address_as_ull = (unsigned long long int*)address;
-        unsigned long long int old = *address_as_ull, assumed;
-    
-	while (val > __longlong_as_double(old))
-	{
-        assumed = old;
-        old = atomicCAS(address_as_ull, assumed,
-                        __double_as_longlong(val));
-    }
-
-    return __longlong_as_double(old);
+    return atomicMin(address, val);
 
 #else
-    double old = *address;
-    *address = max(old, val);
+    T old = *address;
+    *address = min(old, val);
+    return old;
+#endif
+}
+
+// emulate atomic float min with atomicCAS()
+template <>
+inline CUDA_CALLABLE float atomic_min(float* address, float val)
+{
+#if defined(__CUDA_ARCH__)
+    int *address_as_int = (int*)address;
+    int old = *address_as_int, assumed;
+
+    while (val < __int_as_float(old))
+	{
+        assumed = old;
+        old = atomicCAS(address_as_int, assumed,
+                        __float_as_int(val));
+    }
+
+    return __int_as_float(old);
+
+#else
+    float old = *address;
+    *address = min(old, val);
     return old;
 #endif
 }
 
 // emulate atomic double min with atomicCAS()
+template <>
 inline CUDA_CALLABLE double atomic_min(double* address, double val)
 {
 #if defined(__CUDA_ARCH__)
@@ -1443,27 +1523,63 @@ inline CUDA_CALLABLE double atomic_min(double* address, double val)
 #endif
 }
 
-inline CUDA_CALLABLE int atomic_max(int* address, int val)
+template <typename T>
+inline CUDA_CALLABLE T atomic_max(T* address, T val)
 {
 #if defined(__CUDA_ARCH__)
     return atomicMax(address, val);
 
 #else
-    int old = *address;
+    T old = *address;
     *address = max(old, val);
     return old;
 #endif
 }
 
-// atomic int min
-inline CUDA_CALLABLE int atomic_min(int* address, int val)
+// emulate atomic float max with atomicCAS()
+template<>
+inline CUDA_CALLABLE float atomic_max(float* address, float val)
 {
 #if defined(__CUDA_ARCH__)
-    return atomicMin(address, val);
+    int *address_as_int = (int*)address;
+    int old = *address_as_int, assumed;
+
+	while (val > __int_as_float(old))
+	{
+        assumed = old;
+        old = atomicCAS(address_as_int, assumed,
+                        __float_as_int(val));
+    }
+
+    return __int_as_float(old);
 
 #else
-    int old = *address;
-    *address = min(old, val);
+    float old = *address;
+    *address = max(old, val);
+    return old;
+#endif
+}
+
+// emulate atomic double max with atomicCAS()
+template<>
+inline CUDA_CALLABLE double atomic_max(double* address, double val)
+{
+#if defined(__CUDA_ARCH__)
+        unsigned long long int *address_as_ull = (unsigned long long int*)address;
+        unsigned long long int old = *address_as_ull, assumed;
+
+	while (val > __longlong_as_double(old))
+	{
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        __double_as_longlong(val));
+    }
+
+    return __longlong_as_double(old);
+
+#else
+    double old = *address;
+    *address = max(old, val);
     return old;
 #endif
 }
@@ -1486,6 +1602,129 @@ CUDA_CALLABLE inline void adj_atomic_minmax(uint32* buf, uint32* adj_buf, const 
 CUDA_CALLABLE inline void adj_atomic_minmax(int64* buf, int64* adj_buf, const int64 &value, int64 &adj_value) { }
 CUDA_CALLABLE inline void adj_atomic_minmax(uint64* buf, uint64* adj_buf, const uint64 &value, uint64 &adj_value) { }
 CUDA_CALLABLE inline void adj_atomic_minmax(bool* buf, bool* adj_buf, const bool &value, bool &adj_value) { }
+
+
+template<typename T>
+inline CUDA_CALLABLE T atomic_cas(T* address, T compare, T val)
+{
+#if defined(__CUDA_ARCH__)
+    return atomicCAS(address, compare, val);
+#else
+    T old = *address;
+    if (old == compare) 
+    {
+        *address = val;
+    }
+    return old;
+#endif
+}
+
+template<>
+inline CUDA_CALLABLE float atomic_cas(float* address, float compare, float val)
+{
+#if defined(__CUDA_ARCH__)
+    auto result = atomicCAS(reinterpret_cast<unsigned int*>(address), 
+                    reinterpret_cast<unsigned int&>(compare), 
+                    reinterpret_cast<unsigned int&>(val));
+    return reinterpret_cast<float&>(result);
+#else
+    float old = *address;
+    if (old == compare) 
+    {
+        *address = val;
+    }
+    return old;
+#endif
+}
+
+template<>
+inline CUDA_CALLABLE double atomic_cas(double* address, double compare, double val)
+{
+#if defined(__CUDA_ARCH__)
+    auto result = atomicCAS(reinterpret_cast<unsigned long long int *>(address), 
+                    reinterpret_cast<unsigned long long int &>(compare), 
+                    reinterpret_cast<unsigned long long int &>(val));
+    return reinterpret_cast<double&>(result);
+#else
+    double old = *address;
+    if (old == compare) 
+    {
+        *address = val;
+    }
+    return old;
+#endif
+}
+
+template<>
+inline CUDA_CALLABLE int64 atomic_cas(int64* address, int64 compare, int64 val)
+{
+#if defined(__CUDA_ARCH__)
+    auto result = atomicCAS(reinterpret_cast<unsigned long long int *>(address), 
+                    reinterpret_cast<unsigned long long int &>(compare), 
+                    reinterpret_cast<unsigned long long int &>(val));
+    return reinterpret_cast<int64&>(result);
+#else
+    int64 old = *address;
+    if (old == compare) 
+    {
+        *address = val;
+    }
+    return old;
+#endif
+}
+
+template<typename T>
+inline CUDA_CALLABLE T atomic_exch(T* address, T val)
+{
+#if defined(__CUDA_ARCH__)
+    return atomicExch(address, val);
+#else
+    T old = *address;
+    *address = val;
+    return old;
+#endif
+}
+
+template<>
+inline CUDA_CALLABLE double atomic_exch(double* address, double val)
+{
+#if defined(__CUDA_ARCH__)
+    auto result = atomicExch(reinterpret_cast<unsigned long long int*>(address), 
+                     reinterpret_cast<unsigned long long int&>(val));
+    return reinterpret_cast<double&>(result);
+#else
+    double old = *address;
+    *address = val;
+    return old;
+#endif
+}
+
+template<>
+inline CUDA_CALLABLE int64 atomic_exch(int64* address, int64 val)
+{
+#if defined(__CUDA_ARCH__)
+    auto result = atomicExch(reinterpret_cast<unsigned long long int*>(address), 
+                     reinterpret_cast<unsigned long long int&>(val));
+    return reinterpret_cast<int64&>(result);
+#else
+    int64 old = *address;
+    *address = val;
+    return old;
+#endif
+}
+
+
+template<typename T>
+CUDA_CALLABLE inline void adj_atomic_cas(T* address, T compare, T val, T* adj_address, T& adj_compare, T& adj_val, T adj_ret)
+{
+    // Not implemented
+}
+
+template<typename T>
+CUDA_CALLABLE inline void adj_atomic_exch(T* address, T val, T* adj_address, T& adj_val, T adj_ret)
+{
+    // Not implemented
+}
 
 
 } // namespace wp
@@ -1792,6 +2031,7 @@ inline CUDA_CALLABLE void adj_expect_near(const vec3& actual, const vec3& expect
 
 // include array.h so we have the print, isfinite functions for the inner array types defined
 #include "array.h"
+#include "tuple.h"
 #include "mesh.h"
 #include "bvh.h" 
 #include "svd.h"
@@ -1805,5 +2045,6 @@ inline CUDA_CALLABLE void adj_expect_near(const vec3& actual, const vec3& expect
 #if !defined(WP_ENABLE_CUDA) // only include in kernels for now
 #include "tile.h"
 #include "tile_reduce.h"
+#include "tile_scan.h"
 #include "tile_radix_sort.h"
 #endif //!defined(WP_ENABLE_CUDA)

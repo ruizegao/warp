@@ -113,17 +113,18 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.interop.test_dlpack import TestDLPack
     from warp.tests.interop.test_jax import TestJax
     from warp.tests.interop.test_torch import TestTorch
+    from warp.tests.sim.test_cloth import TestCloth
     from warp.tests.sim.test_collision import TestCollision
     from warp.tests.sim.test_coloring import TestColoring
     from warp.tests.sim.test_model import TestModel
     from warp.tests.sim.test_sim_grad import TestSimGradients
     from warp.tests.sim.test_sim_kinematics import TestSimKinematics
-    from warp.tests.sim.test_vbd import TestVbd
     from warp.tests.test_adam import TestAdam
     from warp.tests.test_arithmetic import TestArithmetic
     from warp.tests.test_array import TestArray
     from warp.tests.test_array_reduce import TestArrayReduce
     from warp.tests.test_atomic import TestAtomic
+    from warp.tests.test_atomic_cas import TestAtomicCAS
     from warp.tests.test_bool import TestBool
     from warp.tests.test_builtins_resolution import TestBuiltinsResolution
     from warp.tests.test_closest_point_edge_edge import TestClosestPointEdgeEdgeMethods
@@ -163,10 +164,10 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_linear_solvers import TestLinearSolvers
     from warp.tests.test_lvalue import TestLValue
     from warp.tests.test_mat import TestMat
+    from warp.tests.test_mat_constructors import TestMatConstructors
     from warp.tests.test_mat_lite import TestMatLite
     from warp.tests.test_mat_scalar_ops import TestMatScalarOps
     from warp.tests.test_math import TestMath
-    from warp.tests.test_mlp import TestMLP
     from warp.tests.test_module_hashing import TestModuleHashing
     from warp.tests.test_modules_lite import TestModuleLite
     from warp.tests.test_noise import TestNoise
@@ -193,13 +194,19 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.test_types import TestTypes
     from warp.tests.test_utils import TestUtils
     from warp.tests.test_vec import TestVec
+    from warp.tests.test_vec_constructors import TestVecConstructors
     from warp.tests.test_vec_lite import TestVecLite
     from warp.tests.test_vec_scalar_ops import TestVecScalarOps
     from warp.tests.test_verify_fp import TestVerifyFP
     from warp.tests.tile.test_tile import TestTile
+    from warp.tests.tile.test_tile_cholesky import TestTileCholesky
+    from warp.tests.tile.test_tile_load import TestTileLoad
     from warp.tests.tile.test_tile_mathdx import TestTileMathDx
+    from warp.tests.tile.test_tile_matmul import TestTileMatmul
     from warp.tests.tile.test_tile_reduce import TestTileReduce
     from warp.tests.tile.test_tile_shared_memory import TestTileSharedMemory
+    from warp.tests.tile.test_tile_sort import TestTileSort
+    from warp.tests.tile.test_tile_view import TestTileView
 
     test_classes = [
         TestAdam,
@@ -208,10 +215,12 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestArrayReduce,
         TestAsync,
         TestAtomic,
+        TestAtomicCAS,
         TestBool,
         TestBuiltinsResolution,
         TestBvh,
         TestClosestPointEdgeEdgeMethods,
+        TestCloth,
         TestCodeGen,
         TestCodeGenInstancing,
         TestCollision,
@@ -254,6 +263,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestLValue,
         TestMarchingCubes,
         TestMat,
+        TestMatConstructors,
         TestMatLite,
         TestMatScalarOps,
         TestMath,
@@ -262,7 +272,6 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestMeshQueryAABBMethods,
         TestMeshQueryPoint,
         TestMeshQueryRay,
-        TestMLP,
         TestModel,
         TestModuleHashing,
         TestModuleLite,
@@ -292,16 +301,21 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestStruct,
         TestTape,
         TestTile,
+        TestTileCholesky,
+        TestTileLoad,
         TestTileMathDx,
+        TestTileMatmul,
         TestTileReduce,
         TestTileSharedMemory,
+        TestTileSort,
+        TestTileView,
         TestTorch,
         TestTransientModule,
         TestTriangleClosestPoint,
         TestTypes,
         TestUtils,
-        TestVbd,
         TestVec,
+        TestVecConstructors,
         TestVecLite,
         TestVecScalarOps,
         TestVerifyFP,
@@ -350,7 +364,7 @@ def kit_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader):
     from warp.tests.test_lvalue import TestLValue
     from warp.tests.test_mat_lite import TestMatLite
     from warp.tests.test_math import TestMath
-    from warp.tests.test_mlp import TestMLP
+    from warp.tests.test_module_aot import TestModuleAOT
     from warp.tests.test_module_hashing import TestModuleHashing
     from warp.tests.test_modules_lite import TestModuleLite
     from warp.tests.test_noise import TestNoise
@@ -397,7 +411,7 @@ def kit_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader):
         TestMeshQueryAABBMethods,
         TestMeshQueryPoint,
         TestMeshQueryRay,
-        TestMLP,
+        TestModuleAOT,
         TestModuleHashing,
         TestModuleLite,
         TestNoise,

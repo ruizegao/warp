@@ -647,7 +647,6 @@ class UsdRenderer:
             mesh.GetDisplayColorAttr().Set(colors, self.time)
 
         self._shape_constructors[name] = UsdGeom.Mesh
-        self._shape_custom_scale[name] = scale
 
         if not is_template:
             _usd_set_xform(mesh, pos, rot, scale, self.time)
@@ -837,7 +836,7 @@ class UsdRenderer:
         instancer.GetVisibilityAttr().Set("inherited" if visible else "invisible", self.time)
 
     def render_points(self, name: str, points, radius, colors=None, as_spheres: bool = True, visible: bool = True):
-        from pxr import Sdf, UsdGeom
+        from pxr import Sdf, UsdGeom, Vt
 
         instancer_path = self._resolve_path(name)
 
@@ -863,7 +862,7 @@ class UsdRenderer:
                 primvar_api = UsdGeom.PrimvarsAPI(instancer)
 
                 instancer.CreatePrototypesRel().SetTargets((sphere.GetPath(),))
-                instancer.CreateProtoIndicesAttr().Set((0,) * len(points))
+                instancer.CreateProtoIndicesAttr().Set(Vt.IntArray((0,) * len(points)))
 
                 if colors is not None:
                     primvar_api.CreatePrimvar("displayColor", Sdf.ValueTypeNames.Color3fArray, color_interp, 1)

@@ -259,7 +259,24 @@ def test_return_annotation_none() -> None:
     user_func_return_none()
 
 
-devices = get_test_devices()
+@wp.func
+def divide_by_zero(x: float):
+    return x / 0.0
+
+
+@wp.func
+def normalize_vector(vec_a: wp.vec3):
+    return wp.normalize(vec_a)
+
+
+@wp.func
+def divide_float64(x: wp.float64):
+    return x / wp.float64(1.23)
+
+
+@wp.func
+def get_array_len(arr: wp.array(dtype=wp.float32)):
+    return len(arr)
 
 
 class TestFunc(unittest.TestCase):
@@ -421,10 +438,37 @@ class TestFunc(unittest.TestCase):
         b = wp.mat22d(1.0, 2.0, 3.0, 4.0)
         with self.assertRaisesRegex(
             RuntimeError,
-            r"^Couldn't find a function 'mul' compatible with " r"the arguments 'mat22f, mat22d'$",
+            r"^Couldn't find a function 'mul' compatible with the arguments 'mat22f, mat22d'$",
         ):
             a * b
 
+    def test_cpython_call_user_function_with_error(self):
+        with self.assertRaisesRegex(
+            ZeroDivisionError,
+            "float division by zero",
+        ):
+            divide_by_zero(1.0)
+
+    def test_cpython_call_user_function_with_wrong_argument_types(self):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"^Error calling function 'divide_float64', no overload found for arguments \(1.0,\)$",
+        ):
+            divide_float64(1.0)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"^Error calling function 'normalize_vector', no overload found for arguments \(1.0,\)$",
+        ):
+            normalize_vector(1.0)
+
+    def test_cpython_call_user_function_with_array_type(self):
+        arr = wp.array((1, 2, 3, 4, 5, 6, 7, 8), dtype=wp.float32)
+        length = get_array_len(arr)
+        assert length == 8
+
+
+devices = get_test_devices()
 
 add_kernel_test(TestFunc, kernel=test_overload_func, name="test_overload_func", dim=1, devices=devices)
 add_function_test(TestFunc, func=test_return_func, name="test_return_func", devices=devices)

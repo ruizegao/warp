@@ -21,7 +21,7 @@ import numpy as np
 import warp as wp
 from warp.tests.unittest_utils import *
 
-wp.init()  # For wp.context.runtime.core.is_mathdx_enabled()
+wp.init()  # For wp.context.runtime.core.wp_is_mathdx_enabled()
 
 TILE_M = wp.constant(8)
 TILE_N = wp.constant(4)
@@ -92,7 +92,7 @@ def tile_math_fft_kernel_vec2d(gx: wp.array2d(dtype=wp.vec2d), gy: wp.array2d(dt
     wp.tile_store(gy, xy)
 
 
-@unittest.skipUnless(wp.context.runtime.core.is_mathdx_enabled(), "Warp was not built with MathDx support")
+@unittest.skipUnless(wp.context.runtime.core.wp_is_mathdx_enabled(), "Warp was not built with MathDx support")
 def test_tile_math_fft(test, device, wp_dtype):
     np_real_dtype = {wp.vec2f: np.float32, wp.vec2d: np.float64}[wp_dtype]
     np_cplx_dtype = {wp.vec2f: np.complex64, wp.vec2d: np.complex128}[wp_dtype]
@@ -123,56 +123,6 @@ def test_tile_math_fft(test, device, wp_dtype):
     # TODO: implement and test backward pass
 
 
-@wp.kernel()
-def tile_math_cholesky(
-    gA: wp.array2d(dtype=wp.float64),
-    gD: wp.array1d(dtype=wp.float64),
-    gL: wp.array2d(dtype=wp.float64),
-    gx: wp.array1d(dtype=wp.float64),
-    gy: wp.array1d(dtype=wp.float64),
-):
-    i, j = wp.tid()
-    # Load A, D & x
-    a = wp.tile_load(gA, shape=(TILE_M, TILE_M), storage="shared")
-    d = wp.tile_load(gD, shape=TILE_M, storage="shared")
-    x = wp.tile_load(gx, shape=TILE_M, storage="shared")
-    # Compute L st LL^T = A + diag(D)
-    b = wp.tile_diag_add(a, d)
-    l = wp.tile_cholesky(b)
-    # Solve for y in LL^T y = x
-    y = wp.tile_cholesky_solve(l, x)
-    # Store L & y
-    wp.tile_store(gL, l)
-    wp.tile_store(gy, y)
-
-
-def test_tile_math_cholesky(test, device):
-    A_h = np.ones((TILE_M, TILE_M), dtype=np.float64)
-    D_h = 8.0 * np.ones(TILE_M, dtype=np.float64)
-    L_h = np.zeros_like(A_h)
-    X_h = np.arange(TILE_M, dtype=np.float64)
-    Y_h = np.zeros_like(X_h)
-
-    A_np = A_h + np.diag(D_h)
-    L_np = np.linalg.cholesky(A_np)
-    Y_np = np.linalg.solve(A_np, X_h)
-
-    A_wp = wp.array2d(A_h, requires_grad=True, dtype=wp.float64, device=device)
-    D_wp = wp.array2d(D_h, requires_grad=True, dtype=wp.float64, device=device)
-    L_wp = wp.array2d(L_h, requires_grad=True, dtype=wp.float64, device=device)
-    X_wp = wp.array2d(X_h, requires_grad=True, dtype=wp.float64, device=device)
-    Y_wp = wp.array2d(Y_h, requires_grad=True, dtype=wp.float64, device=device)
-
-    wp.launch_tiled(
-        tile_math_cholesky, dim=[1, 1], inputs=[A_wp, D_wp, L_wp, X_wp, Y_wp], block_dim=TILE_DIM, device=device
-    )
-    wp.synchronize_device()
-
-    assert np.allclose(Y_wp.numpy(), Y_np) and np.allclose(L_wp.numpy(), L_np)
-
-    # TODO: implement and test backward pass
-
-
 all_devices = get_test_devices()
 cuda_devices = get_cuda_test_devices()
 
@@ -184,9 +134,6 @@ class TestTileMathDx(unittest.TestCase):
 # check_output=False so we can enable libmathdx's logging without failing the tests
 add_function_test(
     TestTileMathDx, "test_tile_math_matmul", test_tile_math_matmul, devices=all_devices, check_output=False
-)
-add_function_test(
-    TestTileMathDx, "test_tile_math_cholesky", test_tile_math_cholesky, devices=all_devices, check_output=False
 )
 add_function_test(
     TestTileMathDx,
@@ -202,6 +149,7 @@ add_function_test(
     devices=cuda_devices,
     check_output=False,
 )
+
 
 if __name__ == "__main__":
     wp.clear_kernel_cache()

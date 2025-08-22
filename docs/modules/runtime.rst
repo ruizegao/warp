@@ -1,5 +1,5 @@
-Runtime Reference
-=================
+Python Reference
+================
 
 .. currentmodule:: warp
 
@@ -24,11 +24,19 @@ The following example shows a simple kernel that adds two arrays together::
 
 Kernels are launched with the :func:`wp.launch() <launch>` function on a specific device (CPU/GPU)::
 
-    wp.launch(add_kernel, dim=1024, inputs=[a, b, c], device="cuda")
+    wp.launch(add_kernel, dim=1024, inputs=[a, b], outputs=[c], device="cuda")
 
-Note that all the kernel inputs must live on the target device or a runtime exception will be raised.
-Kernels may be launched with multi-dimensional grid bounds. In this case, threads are not assigned a single index,
-but a coordinate in an n-dimensional grid, e.g.::
+Note that all the kernel inputs and outputs must live on the target device or a runtime exception will be raised.
+
+Unless you are using the :ref:`Graph visualization tool<visualizing_computation_graphs>`, the ``outputs`` argument is optional -- all kernel 
+arguments may be passed as inputs, but for readability it is sometimes useful to distinguish between the 
+kernel arguments that are read from (``inputs``) and the kernel arguments that are written to (``outputs``). 
+So in the above example, it would be equally valid to write ``inputs=[a, b, c]`` but since we are writing to ``c``,
+we list it in the ``outputs`` argument. Note that the combined ``inputs`` followed by ``outputs`` list 
+should match the ordering of the kernel arguments.
+
+Kernels may be launched with multi-dimensional grid bounds.
+In this case, threads are not assigned a single index, but a coordinate in an n-dimensional grid, e.g.::
 
     wp.launch(complex_kernel, dim=(128, 128, 3), ...)
 
@@ -149,6 +157,25 @@ Additionally, data can be copied between arrays in different memory spaces using
     # copy from source CPU buffer to GPU
     wp.copy(dest_array, src_array)
 
+When indexing an array with an array of integers, the result is an :ref:`indexed array<Indexed_Arrays>`:
+
+.. testcode::
+
+    import warp as wp
+
+    arr = wp.array((1, 2, 3, 4, 5, 6))
+    sub = arr[wp.array((0, 2, 4), dtype=wp.int32)] # advanced indexing -> wp.indexedarray
+
+    print(type(arr), arr.shape)
+    print(type(sub), sub.shape)
+    print(sub)
+
+.. testoutput::
+
+    <class 'warp.types.array'> (6,)
+    <class 'warp.types.indexedarray'> (3,)
+    [1 3 5]
+
 .. autoclass:: array
     :members:
     :undoc-members:
@@ -195,6 +222,210 @@ The following construction methods are provided for allocating zero-initialized 
 .. autofunction:: empty_like
 .. autofunction:: copy
 .. autofunction:: clone
+
+
+.. _Indexed_Arrays:
+
+Indexed Arrays
+##############
+
+An indexed array is a lightweight view into an existing :class:`warp.array` instance that references elements
+through an explicit integer index list, thus allowing to run kernels on an arbitrary subset of data without any copy.
+
+.. autoclass:: indexedarray
+    :members:
+    :undoc-members:
+    :exclude-members: vars
+
+
+Creating an Indexed Array
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Pass the *data* array together with a list of ``wp.int32`` index arrays, one for each dimension:
+
+.. testcode::
+
+    import warp as wp
+
+    # Base data.
+    arr = wp.array((1.23, 2.34, 3.45, 4.56, 5.67, 6.78), device="cuda")
+
+    # Only view elements at odd indices.
+    idx = wp.array((1, 3, 5), dtype=wp.int32, device="cuda")
+    sub = wp.indexedarray(arr, [idx])  # Same as wp.indexedarray1d(...)
+    print(sub)
+
+.. testoutput::
+
+    [2.34 4.56 6.78]
+
+
+Additionally, ``None`` can be passed to select all elements for any given dimension.
+
+.. testcode::
+
+    import numpy as np
+    import warp as wp
+
+    mat = wp.array(np.arange(25, dtype=np.float32).reshape((5, 5)))
+    rows = wp.array((1, 3), dtype=wp.int32)
+
+    block = wp.indexedarray2d(mat, (rows, None))  # shape == (2, 5)
+    print(block)
+
+.. testoutput::
+
+    [[ 5.  6.  7.  8.  9.]
+     [15. 16. 17. 18. 19.]]
+
+
+The resulting view keeps the ``dtype`` of the source and has a shape given by the lengths of the supplied index arrays.
+
+Alternative constructors are available for convenience:
+
+.. autofunction:: indexedarray1d
+.. autofunction:: indexedarray2d
+.. autofunction:: indexedarray3d
+.. autofunction:: indexedarray4d
+
+
+Interoperability With Other Frameworks
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Frameworks such as PyTorch or JAX do not have a concept equivalent to
+Warp's indexed arrays. Converting an ``wp.indexedarray`` directly therefore
+raises an exception. Two common workarounds are:
+
+1. Make a contiguous copy and share that::
+
+    import warp as wp
+
+    arr = wp.array((1.0, 2.0, 3.0, 4.0), device="cuda")
+    idx = wp.array((0, 3), dtype=int, device="cuda")
+    sub = wp.indexedarray1d(arr, idx)
+    t = wp.to_torch(sub.contiguous())
+
+2. Share the underlying data and index buffers independently (zero-copy)::
+
+    import warp as wp
+
+    arr = wp.array((1.0, 2.0, 3.0, 4.0), device="cuda")
+    idx = wp.array((0, 3), dtype=int, device="cuda")
+    sub = wp.indexedarray1d(arr, idx)
+    t_data = wp.to_torch(sub.data)
+    t_ind = wp.to_torch(sub.indices[0])
+
+
+PyTorch can index with integer tensors, but doing so always copies the data.
+
+
+Structured Arrays
+#################
+
+Structured arrays in Warp allow you to work with arrays of user-defined structs,
+enabling efficient, named access to heterogeneous data fields across the CPU and GPU.
+
+Creating and Viewing Struct Arrays
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When you define a Warp struct, you can allocate a Warp array of that type on the CPU and convert it to a NumPy structured array view (zero-copy):
+
+.. testcode::
+
+    import warp as wp
+    import numpy as np
+
+    @wp.struct
+    class Foo:
+        i: int
+        f: float
+
+    # allocate a Warp array on the CPU
+    a = wp.zeros(5, dtype=Foo, device="cpu")
+
+    # view it in NumPy without copying
+    na = a.numpy()
+
+    # modify via NumPy
+    na["i"][0] = 42
+    na["f"][2] = 13.37
+
+    print(a)
+    
+.. testoutput::
+
+    [(42,  0.  ) ( 0,  0.  ) ( 0, 13.37) ( 0,  0.  ) ( 0,  0.  )]
+
+Initializing via NumPy and Converting to a Warp Array
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+You can also create a NumPy structured array first, then convert it to a Warp array, which works well for batch initialization: ::
+
+    import warp as wp
+    import numpy as np
+    import math
+
+    rng = np.random.default_rng(123)
+
+    @wp.struct
+    class Boid:
+        vel: wp.vec3f
+        wander_angles: wp.vec2f
+        mass: float
+        group: int
+
+    num_boids = 3
+    npboids = np.zeros(num_boids, dtype=Boid.numpy_dtype())
+
+    angles = math.pi - 2 * math.pi * rng.random(num_boids)
+    npboids["vel"][:, 0] = 20 * np.sin(angles)
+    npboids["vel"][:, 2] = 20 * np.cos(angles)
+
+    npboids["wander_angles"][:, 0] = math.pi * rng.random(num_boids)
+    npboids["wander_angles"][:, 1] = 2 * math.pi * rng.random(num_boids)
+
+    npboids["mass"][:] = 0.5 + 0.5 * rng.random(num_boids)
+
+    # create Warp array from prepared NumPy array
+    boids = wp.array(npboids, dtype=Boid)
+
+This approach leverages NumPy's vectorized operations to initialize all array elements efficiently, avoiding Python loops.
+
+Nested Structs and Vector Types
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Structured arrays fully support nested structs and Warp vector (and matrix) types:
+
+.. testcode::
+
+    import warp as wp
+    import numpy as np
+
+    @wp.struct
+    class Bar:
+        x: wp.vec3
+
+    @wp.struct
+    class Foo:
+        i: int
+        f: float
+        bar: Bar
+
+    na = np.zeros(5, dtype=Foo.numpy_dtype())
+
+    na["i"][0] = 42
+    na["f"][2] = 13.37
+    na["bar"]["x"][4] = wp.vec3(1.0)
+
+    a = wp.array(na, dtype=Foo, device="cuda:0")
+
+    print(a.numpy())
+
+.. testoutput::
+
+    [(42,  0.  , ([0., 0., 0.],)) ( 0,  0.  , ([0., 0., 0.],))
+     ( 0, 13.37, ([0., 0., 0.],)) ( 0,  0.  , ([0., 0., 0.],))
+     ( 0,  0.  , ([1., 1., 1.],))]
 
 .. _Data_Types:
 
@@ -678,6 +909,48 @@ Example: Defining Operator Overloads
     wp.launch(kernel, dim=(1,))
     wp.synchronize()
 
+
+Indexing and Slicing
+####################
+
+Indexing and slicing for vectors, matrices, quaternions, and transforms, follow NumPy-like semantics for element access: ::
+
+    @wp.kernel
+    def compute( ... ):
+        v = wp.vec3(1.0, 2.0, 3.0)
+        wp.expect_eq(v[-1], 3.0) # negative indices wrap
+        wp.expect_eq(v[1:], wp.vec2(2.0, 3.0)) # slice returns a new vector
+
+        v[::2] = 0.0 # slice assignment
+        wp.expect_eq(v, wp.vec3(0.0, 2.0, 0.0))
+
+        m = wp.matrix_from_rows(
+            wp.vec3(1.0, 2.0, 3.0),
+            wp.vec3(4.0, 5.0, 6.0),
+            wp.vec3(7.0, 8.0, 9.0),
+        )
+        wp.expect_eq(m[:, 1], wp.vec3(2.0, 5.0, 8.0)) # column vector
+        wp.expect_eq(
+            m[:2, 1:], # 2x2 sub-matrix
+            wp.matrix_from_rows(wp.vec2(2.0, 3.0), wp.vec2(5.0, 6.0))
+        )
+
+        m[:, 0] = wp.vec3(10.0, 11.0, 12.0) # column vector assignment
+        wp.expect_eq(
+            m,
+            wp.matrix_from_rows(
+                wp.vec3(10.0, 2.0, 3.0),
+                wp.vec3(11.0, 5.0, 6.0),
+                wp.vec3(12.0, 8.0, 9.0),
+            )
+        )
+
+Negative indices are wrapped around, such that ``-1`` refers to the last element. Slices always create new copies.
+
+Inside kernels, the ``start / stop / step`` values of a slice must be **compile-time constants**.  Simple element indexing (``v[i]``, ``m[i, j]``) may use run-time
+expressions.
+
+
 Type Conversions
 ################
 
@@ -836,6 +1109,13 @@ to the correct type.
 The multiplication expression ``a * b`` can also be used to perform matrix multiplication
 between `matrix types <Matrices>`_.
 
+Mapping Functions
+#################
+
+The :func:`wp.map()` function can be used to apply a function to each element of an array.
+
+.. autofunction:: warp.utils.map
+
 Streams
 -------
 
@@ -921,9 +1201,233 @@ Note that only launch calls are recorded in the graph; any Python executed outsi
 Typically it is only beneficial to use CUDA graphs when the graph will be reused or launched multiple times, as
 there is a graph-creation overhead.
 
+Conditional Execution
+#####################
+
+CUDA 12.4+ supports conditional graph nodes that enable dynamic control flow in CUDA graphs.
+
+:func:`wp.capture_if <capture_if>` creates a dynamic branch based on a condition. The condition value is read from a single-element ``int`` array, where a non-zero value means that the condition is True.
+
+.. code:: python
+
+    # create condition
+    cond = wp.zeros(1, dtype=int)
+
+    with wp.ScopedCapture() as capture:
+        wp.launch(foo, ...)
+
+        # execute a branch based on the condition value
+        wp.capture_if(cond,
+                      on_true=...,
+                      on_false=...)
+
+        wp.launch(bar, ...)
+
+The condition value can be updated by kernels launched prior to ``capture_if()`` in the same graph (e.g. kernel ``foo`` above) or it can be updated by other means before the graph is launched. Note that during graph capture, the value of the condition is ignored. It is only used when the graph is launched, making dynamic control flow possible.
+
+.. code:: python
+
+    # this will execute the `on_true` branch
+    cond.fill_(1)
+    wp.capture_launch(capture.graph)
+
+    # this will execute the `on_false` branch
+    cond.fill_(0)
+    wp.capture_launch(capture.graph)
+
+The ``on_true`` and ``on_false`` callbacks can be previously captured :class:`Graph` objects or Python callback functions. These callbacks are captured as child graphs of the enclosing graph. It's possible to specify only one or both callbacks, as needed. When the parent graph is launched, the correct child graph is executed based on the value of the condition. This is done efficiently on the device without involving the CPU. 
+
+Here is an example that uses previously captured graphs:
+
+.. code:: python
+
+    @wp.kernel
+    def hello_kernel():
+        print("Hello")
+
+    @wp.kernel
+    def goodbye_kernel():
+        print("Goodbye")
+
+    @wp.kernel
+    def yes_kernel():
+        print("Yes!")
+
+    @wp.kernel
+    def no_kernel():
+        print("No!")
+
+
+    # create condition
+    cond = wp.zeros(1, dtype=int)
+
+    # capture the on_true branch
+    with wp.ScopedCapture() as yes_capture:
+        wp.launch(yes_kernel, dim=1)
+
+    # capture the on_false branch
+    with wp.ScopedCapture() as no_capture:
+        wp.launch(no_kernel, dim=1)
+
+    # capture the main graph
+    with wp.ScopedCapture() as capture:
+        wp.launch(hello_kernel, dim=1)
+
+        # specify branches using subgraphs
+        wp.capture_if(cond,
+                      on_true=yes_capture.graph,
+                      on_false=no_capture.graph)
+
+        wp.launch(goodbye_kernel, dim=1)
+
+    # execute on_true branch
+    cond.fill_(1)
+    wp.capture_launch(capture.graph)
+
+    # execute on_false branch
+    cond.fill_(0)
+    wp.capture_launch(capture.graph)
+
+    wp.synchronize_device()
+
+Here is an example that uses Python callback functions. These callbacks will be captured as child graphs of the main graph:
+
+.. code:: python
+
+    @wp.kernel
+    def hello_kernel():
+        print("Hello")
+
+    @wp.kernel
+    def goodbye_kernel():
+        print("Goodbye")
+
+    @wp.kernel
+    def yes_kernel():
+        print("Yes!")
+
+    @wp.kernel
+    def no_kernel():
+        print("No!")
+
+
+    # create condition
+    cond = wp.zeros(1, dtype=int)
+
+    # Python callback for the on_true branch
+    def yes_callback():
+        wp.launch(yes_kernel, dim=1)
+
+    # Python callback for the on_false branch
+    def no_callback():
+        wp.launch(no_kernel, dim=1)
+
+    # capture the main graph
+    with wp.ScopedCapture() as capture:
+        wp.launch(hello_kernel, dim=1)
+
+        # specify branches using Python callback functions
+        wp.capture_if(cond,
+                      on_true=yes_callback,
+                      on_false=no_callback)
+
+        wp.launch(goodbye_kernel, dim=1)
+
+    # execute on_true branch
+    cond.fill_(1)
+    wp.capture_launch(capture.graph)
+
+    # execute on_false branch
+    cond.fill_(0)
+    wp.capture_launch(capture.graph)
+
+    wp.synchronize_device()
+
+When using Python callback functions, any extra keyword arguments to :func:`wp.capture_if <capture_if>` are forwarded to the callbacks.
+
+:func:`wp.capture_while <capture_while>` creates a dynamic loop based on a condition. Similarly to :func:`wp.capture_if <capture_if>`, the condition value is read from a single-element ``int`` array, where a non-zero value means that the condition is True.
+
+.. code:: python
+
+    # create condition
+    cond = wp.zeros(1, dtype=int)
+
+    with wp.ScopedCapture() as capture:
+        wp.launch(foo, ...)
+
+        # execute the while_body while the condition is true
+        wp.capture_while(cond, while_body=...)
+
+        wp.launch(bar, ...)
+
+The ``while_body`` callback will be executed as long as the condition is non-zero. The callback is responsible for updating the condition value so that the loop eventually terminates. The ``while_body`` argument can be a previously captured graph or a Python callback function. Here is an example that will run some number of iterations, using the condition value as a counter:
+
+.. code:: python
+
+    @wp.kernel
+    def hello_kernel():
+        print("Hello")
+
+    @wp.kernel
+    def goodbye_kernel():
+        print("Goodbye")
+
+    @wp.kernel
+    def body_kernel(cond: wp.array(dtype=int)):
+        tid = wp.tid()
+        print(cond[0])
+        # decrement the condition counter
+        if tid == 0:
+            cond[0] -= 1    
+
+
+    # create condition
+    cond = wp.zeros(1, dtype=int)
+
+    # capture the while_body
+    with wp.ScopedCapture() as body_capture:
+        wp.launch(body_kernel, dim=1, inputs=[cond])
+
+    # capture the main graph
+    with wp.ScopedCapture() as capture:
+        wp.launch(hello_kernel, dim=1)
+
+        # dynamic loop
+        wp.capture_while(cond, while_body=body_capture.graph)
+
+        wp.launch(goodbye_kernel, dim=1)
+
+    # loop 5 times
+    cond.fill_(5)
+    wp.capture_launch(capture.graph)
+
+    # loop 2 times
+    cond.fill_(2)
+    wp.capture_launch(capture.graph)
+
+    wp.synchronize_device()
+
+
+.. note::
+    Conditional graph node support is only available if Warp is built using CUDA Toolkit 12.4+ and the NVIDIA driver supports CUDA 12.4+.
+
+.. note::
+    Due to a current CUDA limitation, graphs with conditional nodes cannot be used as child graphs. It means that it's not possible to create nested conditional constructs using previously captured graphs. If nesting is required, using Python callback functions is the way to go.
+
+.. note::
+    :func:`wp.capture_if <capture_if>` and :func:`wp.capture_while <capture_while>` will work even without graph capture on any device. If there is no active capture, the condition will be evaluated on the CPU and the correct branch will be executed immediately. This makes it possible to write code that works similarly with and without graph capture.
+
+
+
+Graph API Reference
+###################
+
 .. autofunction:: capture_begin
 .. autofunction:: capture_end
 .. autofunction:: capture_launch
+.. autofunction:: capture_if
+.. autofunction:: capture_while
+.. autofunction:: capture_debug_dot_print
 
 .. autoclass:: ScopedCapture
     :members:
@@ -1230,7 +1734,7 @@ Marching Cubes
 
 The :class:`wp.MarchingCubes <MarchingCubes>` class can be used to extract a 2-D mesh approximating an
 isosurface of a 3-D scalar field. The resulting triangle mesh can be saved to a USD
-file using the :class:`warp.renderer.UsdRenderer`.
+file using the :class:`warp.render.UsdRenderer`.
 
 See :github:`warp/examples/core/example_marching_cubes.py` for a usage example.
 
@@ -1311,3 +1815,10 @@ and will remain cached even if :func:`wp.clear_kernel_cache() <clear_kernel_cach
 :func:`wp.clear_lto_cache() <clear_lto_cache>` can be used to clear the LTO cache.
 
 .. autofunction:: clear_lto_cache
+
+Module Management
+-----------------
+
+.. autofunction:: warp.compile_aot_module
+
+.. autofunction:: warp.load_aot_module

@@ -15,13 +15,15 @@
 
 import ast
 import bisect
+import hashlib
 import re
 import weakref
-from copy import copy
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import warp as wp
+from warp.codegen import get_annotations
 from warp.fem.operator import Integrand
+from warp.fem.types import Domain, Field
 
 _kernel_cache = {}
 _struct_cache = {}
@@ -30,31 +32,92 @@ _func_cache = {}
 _key_re = re.compile("[^0-9a-zA-Z_]+")
 
 
-def _make_key(obj, suffix: str, use_qualified_name):
-    base_name = f"{obj.__module__}.{obj.__qualname__}" if use_qualified_name else obj.__name__
-    return _key_re.sub("", f"{base_name}_{suffix}")
+def _make_key(obj, suffix: str, options: Optional[Dict[str, Any]] = None):
+    # human-readable part
+    suffix = str(suffix)
+
+    sorted_opts = sorted(options.items()) if options is not None else ()
+    opts_str = "".join(
+        (
+            obj.__module__,
+            obj.__qualname__,
+            suffix,
+            *(opt[0] for opt in sorted_opts),
+            *(str(opt[1]) for opt in sorted_opts),
+        )
+    )
+    uid = hashlib.blake2b(bytes(opts_str, encoding="utf-8"), digest_size=4).hexdigest()
+
+    # avoid long keys, issues on win
+    key = f"{obj.__name__}_{suffix[:32]}_{uid}"
+
+    return key
 
 
-def get_func(func, suffix: str, use_qualified_name: bool = False, code_transformers=None):
-    key = _make_key(func, suffix, use_qualified_name)
+def _arg_type_name(arg_type):
+    if isinstance(arg_type, str):
+        return arg_type
+    if arg_type in (Field, Domain):
+        return ""
+    return wp.types.get_type_code(wp.types.type_to_warp(arg_type))
 
-    if key not in _func_cache:
-        _func_cache[key] = wp.Function(
-            func=func,
-            key=key,
-            namespace="",
-            module=wp.get_module(
-                func.__module__,
-            ),
+
+def _make_cache_key(func, key, argspec=None, allow_overloads: bool = True):
+    if not allow_overloads:
+        return key
+
+    if argspec is None:
+        annotations = get_annotations(func)
+    else:
+        annotations = argspec.annotations
+
+    sig_key = (key, tuple((k, _arg_type_name(v)) for k, v in annotations.items()))
+    return sig_key
+
+
+def _register_function(
+    func,
+    key,
+    module,
+    **kwargs,
+):
+    # wp.Function will override existing func for a given key...
+    # manually add back our overloads
+    key = _key_re.sub("", key)
+    existing = module.functions.get(key)
+    new_fn = wp.Function(
+        func=func,
+        key=key,
+        namespace="",
+        module=module,
+        **kwargs,
+    )
+
+    if existing:
+        existing.add_overload(new_fn)
+        module.functions[key] = existing
+    return module.functions[key]
+
+
+def get_func(func, suffix: str, code_transformers=None, allow_overloads=False):
+    key = _make_key(func, suffix)
+    cache_key = _make_cache_key(func, key, allow_overloads=allow_overloads)
+
+    if cache_key not in _func_cache:
+        module = wp.get_module(func.__module__)
+        _func_cache[cache_key] = _register_function(
+            func,
+            key,
+            module,
             code_transformers=code_transformers,
         )
 
-    return _func_cache[key]
+    return _func_cache[cache_key]
 
 
-def dynamic_func(suffix: str, use_qualified_name=False, code_transformers=None):
+def dynamic_func(suffix: str, code_transformers=None, allow_overloads=False):
     def wrap_func(func: Callable):
-        return get_func(func, suffix=suffix, use_qualified_name=use_qualified_name, code_transformers=code_transformers)
+        return get_func(func, suffix=suffix, code_transformers=code_transformers, allow_overloads=allow_overloads)
 
     return wrap_func
 
@@ -62,55 +125,55 @@ def dynamic_func(suffix: str, use_qualified_name=False, code_transformers=None):
 def get_kernel(
     func,
     suffix: str,
-    use_qualified_name: bool = False,
     kernel_options: Optional[Dict[str, Any]] = None,
+    allow_overloads=False,
 ):
     if kernel_options is None:
         kernel_options = {}
 
-    key = _make_key(func, suffix, use_qualified_name)
+    key = _make_key(func, suffix, kernel_options)
+    cache_key = _make_cache_key(func, key, allow_overloads=allow_overloads)
 
-    if key not in _kernel_cache:
-        # Avoid creating too long file names -- can lead to issues on Windows
-        # We could hash the key, but prefer to keep it human-readable
-        module_name = f"{func.__module__}.dyn.{key}"
-        module_name = module_name[:128] if len(module_name) > 128 else module_name
+    if cache_key not in _kernel_cache:
+        kernel_key = _key_re.sub("", key)
+        module_name = f"{func.__module__}.dyn.{kernel_key}"
         module = wp.get_module(module_name)
-        module.options = copy(wp.get_module(func.__module__).options)
+        module.options = dict(wp.get_module(func.__module__).options)
         module.options.update(kernel_options)
-        _kernel_cache[key] = wp.Kernel(func=func, key=key, module=module)
-    return _kernel_cache[key]
+        _kernel_cache[cache_key] = wp.Kernel(func=func, key=kernel_key, module=module, options=kernel_options)
+    return _kernel_cache[cache_key]
 
 
-def dynamic_kernel(suffix: str, use_qualified_name=False, kernel_options: Optional[Dict[str, Any]] = None):
+def dynamic_kernel(suffix: str, kernel_options: Optional[Dict[str, Any]] = None, allow_overloads=False):
     if kernel_options is None:
         kernel_options = {}
 
     def wrap_kernel(func: Callable):
-        return get_kernel(func, suffix=suffix, use_qualified_name=use_qualified_name, kernel_options=kernel_options)
+        return get_kernel(func, suffix=suffix, kernel_options=kernel_options, allow_overloads=allow_overloads)
 
     return wrap_kernel
 
 
-def get_struct(struct: type, suffix: str, use_qualified_name: bool = False):
-    key = _make_key(struct, suffix, use_qualified_name)
-    # used in codegen
-    struct.__qualname__ = key
+def get_struct(struct: type, suffix: str):
+    key = _make_key(struct, suffix)
+    cache_key = key
 
-    if key not in _struct_cache:
+    if cache_key not in _struct_cache:
+        # used in codegen
+        struct.__qualname__ = _key_re.sub("", key)
         module = wp.get_module(struct.__module__)
-        _struct_cache[key] = wp.codegen.Struct(
+        _struct_cache[cache_key] = wp.codegen.Struct(
+            key=struct.__qualname__,
             cls=struct,
-            key=key,
             module=module,
         )
 
-    return _struct_cache[key]
+    return _struct_cache[cache_key]
 
 
-def dynamic_struct(suffix: str, use_qualified_name=False):
+def dynamic_struct(suffix: str):
     def wrap_struct(struct: type):
-        return get_struct(struct, suffix=suffix, use_qualified_name=use_qualified_name)
+        return get_struct(struct, suffix=suffix)
 
     return wrap_struct
 
@@ -125,35 +188,36 @@ def get_argument_struct(arg_types: Dict[str, type]):
         setattr(Args, name, None)
         annotations[name] = arg_type
 
-    def arg_type_name(arg_type):
-        return wp.types.get_type_code(wp.types.type_to_warp(arg_type))
-
     try:
         Args.__annotations__ = annotations
     except AttributeError:
         Args.__dict__.__annotations__ = annotations
 
-    suffix = "_".join([f"{name}_{arg_type_name(arg_type)}" for name, arg_type in annotations.items()])
+    suffix = "_".join([f"{name}_{_arg_type_name(arg_type)}" for name, arg_type in annotations.items()])
 
     return get_struct(Args, suffix=suffix)
 
 
-def populate_argument_struct(Args: wp.codegen.Struct, values: Dict[str, Any], func_name: str):
+def populate_argument_struct(
+    Args: wp.codegen.Struct, values: Dict[str, Any], func_name: str, value_struct_values: Optional = None
+):
     if values is None:
         values = {}
 
-    value_struct_values = Args()
-    for k, v in values.items():
-        try:
+    if value_struct_values is None:
+        value_struct_values = Args()
+
+    try:
+        for k, v in values.items():
             setattr(value_struct_values, k, v)
-        except Exception as err:
-            if k not in Args.vars:
-                raise ValueError(
-                    f"Passed value argument '{k}' does not match any of the function '{func_name}' parameters"
-                ) from err
+    except Exception as err:
+        if k not in Args.vars:
             raise ValueError(
-                f"Passed value argument '{k}' of type '{wp.types.type_repr(v)}' is incompatible with the function '{func_name}' parameter of type '{wp.types.type_repr(Args.vars[k].type)}'"
+                f"Passed value argument '{k}' does not match any of the function '{func_name}' parameters"
             ) from err
+        raise ValueError(
+            f"Passed value argument '{k}' of type '{wp.types.type_repr(v)}' is incompatible with the function '{func_name}' parameter of type '{wp.types.type_repr(Args.vars[k].type)}'"
+        ) from err
 
     missing_values = Args.vars.keys() - values.keys()
     if missing_values:
@@ -208,19 +272,19 @@ def get_integrand_function(
     annotations=None,
     code_transformers=None,
 ):
-    key = _make_key(integrand.func, suffix, use_qualified_name=True)
+    key = _make_key(integrand.func, suffix)
+    cache_key = _make_cache_key(integrand.func, key, integrand.argspec)
 
-    if key not in _func_cache:
-        _func_cache[key] = wp.Function(
+    if cache_key not in _func_cache:
+        _func_cache[cache_key] = _register_function(
             func=integrand.func if func is None else func,
             key=key,
-            namespace="",
             module=integrand.module,
             overloaded_annotations=annotations,
             code_transformers=code_transformers,
         )
 
-    return _func_cache[key]
+    return _func_cache[cache_key]
 
 
 def get_integrand_kernel(
@@ -235,15 +299,16 @@ def get_integrand_kernel(
     if kernel_options is not None:
         options.update(kernel_options)
 
-    kernel_key = _make_key(integrand.func, suffix, use_qualified_name=True)
-    opts_key = "".join([f"{k}:{v}" for k, v in sorted(options.items())])
-    cache_key = kernel_key + opts_key
+    kernel_key = _make_key(integrand.func, suffix, options=options)
+    cache_key = _make_cache_key(integrand, kernel_key, integrand.argspec, allow_overloads=True)
 
     if cache_key not in _kernel_cache:
         if kernel_fn is None:
             return None
 
-        module = wp.get_module(f"{integrand.module.name}.{integrand.name}")
+        kernel_key = _key_re.sub("", kernel_key)
+        module = wp.get_module(f"{integrand.module.name}.{kernel_key}")
+        module.options = options
         _kernel_cache[cache_key] = wp.Kernel(
             func=kernel_fn, key=kernel_key, module=module, code_transformers=code_transformers, options=options
         )
@@ -270,6 +335,40 @@ def cached_arg_value(func: Callable):
         return cache[device.ordinal]
 
     return get_arg
+
+
+def setup_dynamic_attributes(
+    obj,
+    cls: Optional[type] = None,
+    constructors: Optional[Dict[str, Callable]] = None,
+    key: Optional[str] = None,
+):
+    if cls is None:
+        cls = type(obj)
+
+    if key is None:
+        key = obj.name
+
+    if constructors is None:
+        constructors = cls._dynamic_attribute_constructors
+
+    key = (key, frozenset(constructors.keys()))
+
+    if not hasattr(cls, "_cached_dynamic_attrs"):
+        cls._cached_dynamic_attrs = {}
+
+    attrs = cls._cached_dynamic_attrs.get(key)
+    if attrs is None:
+        attrs = {}
+        # create attributes one-by-one, as some may depend on previous ones
+        for k, v in constructors.items():
+            attr = v(obj)
+            attrs[k] = attr
+            setattr(obj, k, attr)
+        cls._cached_dynamic_attrs[key] = attrs
+    else:
+        for k, v in attrs.items():
+            setattr(obj, k, v)
 
 
 _cached_vec_types = {}
@@ -447,15 +546,13 @@ class TemporaryStore:
         dtype = wp.types.type_to_warp(dtype)
         device = wp.get_device(device)
 
-        type_length = wp.types.type_length(dtype)
-        key = (dtype._type_, type_length, pinned, device.ordinal)
+        type_size = wp.types.type_size(dtype)
+        key = (dtype._type_, type_size, pinned, device.ordinal)
 
         pool = self._temporaries.get(key, None)
         if pool is None:
             value_type = (
-                cached_vec_type(length=type_length, dtype=wp.types.type_scalar_type(dtype))
-                if type_length > 1
-                else dtype
+                cached_vec_type(length=type_size, dtype=wp.types.type_scalar_type(dtype)) if type_size > 1 else dtype
             )
             pool = TemporaryStore.Pool(value_type, device, pinned=pinned)
             self._temporaries[key] = pool

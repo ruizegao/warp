@@ -74,6 +74,46 @@ def test_tile_reduce_sum(test, device):
 
 
 @wp.kernel
+def tile_sum_to_shared_kernel(input: wp.array2d(dtype=float), output: wp.array(dtype=float)):
+    i, lane = wp.tid()
+
+    a = wp.tile_load(input[i], shape=TILE_DIM)
+    s = wp.tile_sum(a)
+    v = s[0]  # force shared storage for s
+    wp.tile_store(output, s * 0.5, offset=i)
+
+
+def test_tile_sum_to_shared(test, device):
+    batch_count = 1
+
+    rng = np.random.default_rng(42)
+    input = rng.random((batch_count, TILE_DIM), dtype=np.float32)
+
+    input_wp = wp.array(input, requires_grad=True, device=device, dtype=float)
+    output_wp = wp.zeros(batch_count, requires_grad=True, device=device, dtype=float)
+
+    with wp.Tape() as tape:
+        wp.launch_tiled(
+            tile_sum_to_shared_kernel,
+            dim=[batch_count],
+            inputs=[input_wp, output_wp],
+            block_dim=TILE_DIM,
+            device=device,
+        )
+
+    sum_wp = output_wp.numpy()
+    for i in range(batch_count):
+        sum_np = np.sum(input[i], axis=0) * 0.5
+        assert_np_equal(sum_wp[i], sum_np, tol=0.0001)
+
+    output_wp.grad.fill_(1.0)
+
+    tape.backward()
+
+    assert_np_equal(input_wp.grad.numpy(), np.ones_like(input) * 0.5, tol=1.0e-4)
+
+
+@wp.kernel
 def tile_min_kernel(input: wp.array2d(dtype=float), output: wp.array(dtype=float)):
     # output tile index
     i = wp.tid()
@@ -82,6 +122,13 @@ def tile_min_kernel(input: wp.array2d(dtype=float), output: wp.array(dtype=float
     m = wp.tile_min(a)
 
     wp.tile_store(output, m, offset=i)
+
+
+@wp.kernel
+def tile_min_kernel_edge_case(x: wp.array2d(dtype=float), y: wp.array(dtype=float)):
+    t = wp.tile_load(x, shape=(3, 3))
+    min = wp.tile_min(t)
+    wp.tile_store(y, min)
 
 
 def test_tile_reduce_min(test, device):
@@ -105,6 +152,14 @@ def test_tile_reduce_min(test, device):
         min_np = np.min(input[i])
         test.assertAlmostEqual(min_wp[i], min_np, places=4)
 
+    # test edge case: tile is multiple warps in size but at least one is empty
+    x = wp.array(np.array([[2.0, 2.0, 3.0], [4.0, 1.0, 6.0], [7.0, 3.0, 9.0]]), dtype=float, device=device)
+    y = wp.zeros(1, dtype=float, device=device)
+
+    wp.launch_tiled(tile_min_kernel_edge_case, dim=1, inputs=[x, y], block_dim=64, device=device)
+
+    assert_np_equal(y.numpy(), np.array([1.0]))
+
 
 @wp.kernel
 def tile_argmin_kernel(input: wp.array2d(dtype=float), output: wp.array(dtype=int)):
@@ -115,6 +170,13 @@ def tile_argmin_kernel(input: wp.array2d(dtype=float), output: wp.array(dtype=in
     m = wp.tile_argmin(a)
 
     wp.tile_store(output, m, offset=i)
+
+
+@wp.kernel
+def tile_argmin_kernel_edge_case(x: wp.array2d(dtype=float), y: wp.array(dtype=int)):
+    t = wp.tile_load(x, shape=(3, 3))
+    min = wp.tile_argmin(t)
+    wp.tile_store(y, min)
 
 
 def test_tile_reduce_argmin(test, device):
@@ -137,6 +199,14 @@ def test_tile_reduce_argmin(test, device):
     for i in range(batch_count):
         argmin_np = np.argmin(input[i])
         test.assertAlmostEqual(argmin_wp[i], argmin_np, places=4)
+
+    # test edge case: tile is multiple warps in size but at least one is empty
+    x = wp.array(np.array([[2.0, 2.0, 3.0], [4.0, 1.0, 6.0], [7.0, 3.0, 9.0]]), dtype=float, device=device)
+    y = wp.zeros(1, dtype=int, device=device)
+
+    wp.launch_tiled(tile_argmin_kernel_edge_case, dim=1, inputs=[x, y], block_dim=64, device=device)
+
+    assert_np_equal(y.numpy(), np.array([4]))
 
 
 @wp.kernel
@@ -242,6 +312,79 @@ def test_tile_reduce_custom(test, device):
         test.assertAlmostEqual(prod_wp[i], prod_np, places=4)
 
 
+def create_tile_scan_inclusive_kernel(tile_dim: int):
+    @wp.kernel(module="unique")
+    def tile_scan_inclusive_kernel(input: wp.array2d(dtype=float), output: wp.array2d(dtype=float)):
+        i = wp.tid()
+        t = wp.tile_load(input[i], shape=tile_dim)
+        t = wp.tile_scan_inclusive(t)
+        wp.tile_store(output[i], t)
+
+    return tile_scan_inclusive_kernel
+
+
+def test_tile_scan_inclusive(test, device):
+    batch_count = 56
+    N = 1234
+
+    rng = np.random.default_rng(42)
+    input = rng.random((batch_count, N), dtype=np.float32)
+
+    input_wp = wp.array2d(input, requires_grad=True, device=device)
+    output_wp = wp.zeros_like(input_wp, requires_grad=True, device=device)
+
+    with wp.Tape() as tape:
+        wp.launch_tiled(
+            create_tile_scan_inclusive_kernel(N),
+            dim=[batch_count],
+            inputs=[input_wp, output_wp],
+            block_dim=TILE_DIM,
+            device=device,
+        )
+
+    scan_wp = output_wp.numpy()
+    for i in range(batch_count):
+        scan_np = np.cumsum(input[i])
+        np.testing.assert_allclose(scan_wp[i], scan_np, rtol=1e-5, atol=1e-6)
+
+
+def create_tile_scan_exclusive_kernel(tile_dim: int):
+    @wp.kernel(module="unique")
+    def tile_scan_exclusive_kernel(input: wp.array2d(dtype=float), output: wp.array2d(dtype=float)):
+        i = wp.tid()
+        t = wp.tile_load(input[i], shape=tile_dim)
+        t = wp.tile_scan_exclusive(t)
+        wp.tile_store(output[i], t)
+
+    return tile_scan_exclusive_kernel
+
+
+def test_tile_scan_exclusive(test, device):
+    batch_count = 56
+    N = 1234
+
+    rng = np.random.default_rng(42)
+    input = rng.random((batch_count, N), dtype=np.float32)
+
+    input_wp = wp.array2d(input, requires_grad=True, device=device)
+    output_wp = wp.zeros_like(input_wp, requires_grad=True, device=device)
+
+    with wp.Tape() as tape:
+        wp.launch_tiled(
+            create_tile_scan_exclusive_kernel(N),
+            dim=[batch_count],
+            inputs=[input_wp, output_wp],
+            block_dim=TILE_DIM,
+            device=device,
+        )
+
+    scan_wp = output_wp.numpy()
+    for i in range(batch_count):
+        scan_np = np.zeros(N, dtype=np.float32)
+        scan_np[1:] = np.cumsum(input[i][:-1])
+        np.testing.assert_allclose(scan_wp[i], scan_np, rtol=1e-5, atol=1e-6)
+
+
 @wp.struct
 class KeyValue:
     key: wp.int32
@@ -325,7 +468,7 @@ def test_tile_reduce_grouped_sum(test, device):
 
     with wp.Tape() as tape:
         wp.launch_tiled(
-            tile_sum_kernel, dim=[batch_count], inputs=[input_wp, output_wp], block_dim=TILE_DIM, device=device
+            tile_grouped_sum_kernel, dim=[batch_count], inputs=[input_wp, output_wp], block_dim=TILE_DIM, device=device
         )
 
     sum_wp = output_wp.numpy()
@@ -425,17 +568,17 @@ def test_untile_vector_kernel(input: wp.array(dtype=wp.vec3), output: wp.array(d
 
 
 def test_tile_untile_vector(test, device):
-    input = wp.full(16, wp.vec3(1.0, 2.0, 3.0), requires_grad=True, device=device)
+    input = wp.full(TILE_DIM, wp.vec3(1.0, 2.0, 3.0), requires_grad=True, device=device)
     output = wp.zeros_like(input, device=device)
 
     with wp.Tape() as tape:
-        wp.launch(test_untile_vector_kernel, dim=16, inputs=[input, output], block_dim=16, device=device)
+        wp.launch(test_untile_vector_kernel, dim=TILE_DIM, inputs=[input, output], block_dim=TILE_DIM, device=device)
 
     output.grad = wp.ones_like(output, device=device)
     tape.backward()
 
     assert_np_equal(output.numpy(), input.numpy())
-    assert_np_equal(input.grad.numpy(), np.ones((16, 3)))
+    assert_np_equal(input.grad.numpy(), np.ones((TILE_DIM, 3)))
 
 
 @wp.kernel
@@ -489,6 +632,91 @@ def test_tile_arange(test, device):
     assert_np_equal(output.numpy()[4], np.arange(17, 0, -1))
 
 
+@wp.kernel(module="unique")
+def tile_strided_loop_kernel(arr: wp.array(dtype=float), max_val: wp.array(dtype=float)):
+    tid, lane = wp.tid()
+
+    num_threads = wp.block_dim()
+
+    thread_max = wp.float32(-wp.inf)
+
+    length = arr.shape[0]
+    upper = ((length + num_threads - 1) // num_threads) * num_threads
+    for el_id in range(lane, upper, num_threads):
+        if el_id < length:
+            val = arr[el_id]
+        else:
+            val = wp.float32(-wp.inf)
+
+        t = wp.tile(val)
+        local_max = wp.tile_max(t)
+
+        thread_max = wp.max(thread_max, local_max[0])
+
+    if lane == 0:
+        max_val[0] = thread_max
+
+
+def test_tile_strided_loop(test, device):
+    N = 5  # Length of array
+
+    rng = np.random.default_rng(42)
+    input = rng.random(N, dtype=np.float32)
+
+    input_wp = wp.array(input, device=device)
+    output_wp = wp.zeros(1, dtype=wp.float32, device=device)
+
+    wp.launch_tiled(
+        tile_strided_loop_kernel,
+        dim=[1],
+        inputs=[input_wp, output_wp],
+        device=device,
+        block_dim=128,
+    )
+
+    max_wp = output_wp.numpy()
+    max_np = np.max(input)
+    test.assertAlmostEqual(max_wp[0], max_np, places=4)
+
+
+@wp.kernel
+def test_tile_reduce_matrix_kernel(y: wp.array(dtype=wp.mat33)):
+    i = wp.tid()
+    I = wp.identity(3, dtype=wp.float32)
+    m = wp.float32(i) * I
+
+    t = wp.tile(m, preserve_type=True)
+    sum = wp.tile_reduce(wp.add, t)
+
+    wp.tile_atomic_add(y, sum)
+
+
+def test_tile_reduce_matrix(test, device):
+    y = wp.zeros(shape=1, dtype=wp.mat33, device=device)
+
+    wp.launch(test_tile_reduce_matrix_kernel, dim=TILE_DIM, inputs=[], outputs=[y], block_dim=TILE_DIM, device=device)
+
+    assert_np_equal(y.numpy().squeeze(), np.eye(3, dtype=np.float32) * 2016.0)
+
+
+@wp.kernel
+def test_tile_reduce_vector_kernel(out: wp.array(dtype=wp.vec3)):
+    v = wp.vec3f(1.0)
+    v_tile = wp.tile(v, preserve_type=True)
+
+    sum = wp.tile_reduce(wp.add, v_tile)
+
+    wp.tile_atomic_add(out, sum)
+
+
+def test_tile_reduce_vector(test, device):
+    out = wp.zeros(1, dtype=wp.vec3, device=device)
+
+    wp.launch(kernel=test_tile_reduce_vector_kernel, dim=8, inputs=[], outputs=[out], block_dim=TILE_DIM, device=device)
+
+    assert_np_equal(out.numpy(), np.array([[8.0, 8.0, 8.0]]))
+
+
 devices = get_test_devices()
 
 
@@ -497,18 +725,24 @@ class TestTileReduce(unittest.TestCase):
 
 
 add_function_test(TestTileReduce, "test_tile_reduce_sum", test_tile_reduce_sum, devices=devices)
+add_function_test(TestTileReduce, "test_tile_sum_to_shared", test_tile_sum_to_shared, devices=devices)
 add_function_test(TestTileReduce, "test_tile_reduce_min", test_tile_reduce_min, devices=devices)
 add_function_test(TestTileReduce, "test_tile_reduce_max", test_tile_reduce_max, devices=devices)
 add_function_test(TestTileReduce, "test_tile_reduce_argmin", test_tile_reduce_argmin, devices=devices)
 add_function_test(TestTileReduce, "test_tile_reduce_argmax", test_tile_reduce_argmax, devices=devices)
 add_function_test(TestTileReduce, "test_tile_reduce_custom", test_tile_reduce_custom, devices=devices)
 add_function_test(TestTileReduce, "test_tile_reduce_custom_struct", test_tile_reduce_custom_struct, devices=devices)
-add_function_test(TestTileReduce, "test_tile_reduce_grouped_sum", test_tile_reduce_sum, devices=devices)
+add_function_test(TestTileReduce, "test_tile_reduce_grouped_sum", test_tile_reduce_grouped_sum, devices=devices)
 add_function_test(TestTileReduce, "test_tile_reduce_simt", test_tile_reduce_simt, devices=devices)
 add_function_test(TestTileReduce, "test_tile_ones", test_tile_ones, devices=devices)
 add_function_test(TestTileReduce, "test_tile_arange", test_tile_arange, devices=devices)
 add_function_test(TestTileReduce, "test_tile_untile_scalar", test_tile_untile_scalar, devices=devices)
 add_function_test(TestTileReduce, "test_tile_untile_vector", test_tile_untile_vector, devices=devices)
+add_function_test(TestTileReduce, "test_tile_strided_loop", test_tile_strided_loop, devices=devices)
+add_function_test(TestTileReduce, "test_tile_scan_inclusive", test_tile_scan_inclusive, devices=devices)
+add_function_test(TestTileReduce, "test_tile_scan_exclusive", test_tile_scan_exclusive, devices=devices)
+add_function_test(TestTileReduce, "test_tile_reduce_matrix", test_tile_reduce_matrix, devices=devices)
+add_function_test(TestTileReduce, "test_tile_reduce_vector", test_tile_reduce_vector, devices=devices)
 
 if __name__ == "__main__":
     wp.clear_kernel_cache()

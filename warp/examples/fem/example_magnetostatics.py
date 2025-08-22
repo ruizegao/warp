@@ -24,9 +24,9 @@
 # Div. B = 0
 #
 # solved over field A such that B = Curl A,
-# and Direchlet homogeneous essential boundary conditions
+# and Dirichlet homogeneous essential boundary conditions
 #
-# This example also illustrates using an ImplictField to warp a grid mesh
+# This example also illustrates using an ImplicitField to warp a grid mesh
 # to a cylindrical domain
 ###########################################################################
 
@@ -199,7 +199,9 @@ class Example:
         boundary = fem.BoundarySides(sim_geo)
         u_bd = fem.make_trial(space=A_space, domain=boundary)
         v_bd = fem.make_test(space=A_space, domain=boundary)
-        dirichlet_bd_proj = fem.integrate(mass_form, fields={"u": u_bd, "v": v_bd}, nodal=True, output_dtype=float)
+        dirichlet_bd_proj = fem.integrate(
+            mass_form, fields={"u": u_bd, "v": v_bd}, assembly="nodal", output_dtype=float
+        )
         fem.project_linear_system(lhs, rhs, dirichlet_bd_proj)
 
         # solve using Conjugate Residual (numerically rhs may not be in image of lhs)

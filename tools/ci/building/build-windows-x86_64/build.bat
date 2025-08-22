@@ -20,7 +20,6 @@ for %%i in (%*) do (
 
 :: pull packman dependencies
 SET "PLATFORM=windows-x86_64"
-call "%~dp0..\..\..\packman\packman" pull --platform %PLATFORM% "%~dp0..\..\..\..\deps/host-deps.packman.xml" --verbose
 call "%~dp0..\..\..\packman\packman" pull --platform %PLATFORM% "%~dp0..\..\..\..\deps/target-deps.packman.xml" --verbose
 call "%~dp0..\..\..\packman\packman" pull --platform %PLATFORM% "%~dp0..\..\..\..\deps/cuda-toolkit-deps.packman.xml" --verbose --include-tag "cuda-%CUDA_MAJOR_VER%"
 call "%~dp0..\..\..\packman\packman" install --verbose -l "%~dp0..\..\..\..\_build\host-deps\winsdk" winsdk 10.17763
@@ -37,7 +36,7 @@ call %PYTHON% -m pip install cmake
 call %PYTHON% -m pip install ninja
 
 :: Build
-call %PYTHON% "%~dp0..\..\..\..\build_lib.py" ^
+call %PYTHON% -u "%~dp0..\..\..\..\build_lib.py" ^
     --msvc_path="%~dp0..\..\..\..\_build\host-deps\msvc\VC\Tools\MSVC\14.29.30133" ^
     --sdk_path="%~dp0..\..\..\..\_build\host-deps\winsdk" ^
     --cuda_path="%~dp0..\..\..\..\_build\target-deps\cuda" ^

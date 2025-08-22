@@ -92,7 +92,7 @@ class Tape:
         # if scalar loss is specified then initialize
         # a 'seed' array for it, with gradient of one
         if loss:
-            if loss.size > 1 or wp.types.type_length(loss.dtype) > 1:
+            if loss.size > 1 or wp.types.type_size(loss.dtype) > 1:
                 raise RuntimeError("Can only return gradients for scalar loss functions.")
 
             if not loss.requires_grad:
@@ -251,6 +251,8 @@ class Tape:
                     else:
                         grad = None
                     setattr(adj, name, grad)
+                elif isinstance(a._cls.vars[name].type, wp.codegen.Struct):
+                    setattr(adj, name, self.get_adjoint(getattr(a, name)))
                 else:
                     setattr(adj, name, getattr(a, name))
 

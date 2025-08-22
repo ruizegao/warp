@@ -51,7 +51,7 @@ def build_cuda(
         output_path = output_path.encode("utf-8")
 
         if warp.config.llvm_cuda:
-            warp.context.runtime.llvm.compile_cuda(src, cu_path_bytes, inc_path, output_path, False)
+            warp.context.runtime.llvm.wp_compile_cuda(src, cu_path_bytes, inc_path, output_path, False)
 
         else:
             if ltoirs is None:
@@ -67,7 +67,7 @@ def build_cuda(
                 fatbins
             )
             arr_link_input_types = (ctypes.c_int * num_link)(*link_input_types)
-            err = warp.context.runtime.core.cuda_compile_program(
+            err = warp.context.runtime.core.wp_cuda_compile_program(
                 src,
                 program_name_bytes,
                 arch,
@@ -96,7 +96,7 @@ def load_cuda(input_path, device):
     if not device.is_cuda:
         raise RuntimeError("Not a CUDA device")
 
-    return warp.context.runtime.core.cuda_load_module(device.context, input_path.encode("utf-8"))
+    return warp.context.runtime.core.wp_cuda_load_module(device.context, input_path.encode("utf-8"))
 
 
 def build_cpu(obj_path, cpp_path, mode="release", verify_fp=False, fast_math=False, fuse_fp=True):
@@ -106,7 +106,7 @@ def build_cpu(obj_path, cpp_path, mode="release", verify_fp=False, fast_math=Fal
         inc_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "native").encode("utf-8")
         obj_path = obj_path.encode("utf-8")
 
-        err = warp.context.runtime.llvm.compile_cpp(
+        err = warp.context.runtime.llvm.wp_compile_cpp(
             src, cpp_path, inc_path, obj_path, mode == "debug", verify_fp, fuse_fp
         )
         if err != 0:
@@ -128,6 +128,15 @@ def init_kernel_cache(path=None):
         cache_root_dir = os.path.realpath(os.environ.get("WARP_CACHE_PATH"))
     else:
         cache_root_dir = appdirs.user_cache_dir(appname="warp", appauthor="NVIDIA", version=warp.config.version)
+
+        if os.name == "nt" and os.path.isabs(cache_root_dir) and not cache_root_dir.startswith("\\\\?\\"):
+            # Add Windows long-path prefix, accounting for UNC shares.
+            if cache_root_dir.startswith("\\\\"):
+                # UNC path  \\server\share\…  →  \\?\UNC\server\share\…
+                cache_root_dir = "\\\\?\\UNC\\" + cache_root_dir.lstrip("\\")
+            else:
+                # Drive-letter path  C:\…  →  \\?\C:\…
+                cache_root_dir = "\\\\?\\" + cache_root_dir
 
     warp.config.kernel_cache_dir = cache_root_dir
 
@@ -246,7 +255,12 @@ def _build_lto_base(lto_symbol, compile_func, builder, extra_files=None):
             the cached file data.
 
     Returns:
-        Tuple containing lto_code_data followed by any extra data from extra_files
+        Tuple where the first element is a success flag (``bool``). The second
+        element is the LTO code as bytes (or ``None`` on failure).
+        If ``extra_files`` is provided, additional elements follow in the same
+        order as the keys in ``extra_files``:
+          - ``".meta"``: int (shared memory bytes).
+          - ``"_fatbin.lto"``: bytes (universal fatbin).
     """
     if extra_files is None:
         extra_files = {}
@@ -283,9 +297,9 @@ def _build_lto_base(lto_symbol, compile_func, builder, extra_files=None):
 
         if all_files_cached:
             if not extra_files:
-                return (lto_code_data,)
+                return (True, lto_code_data)
             else:
-                return (lto_code_data, *[extra_files[ext] for ext in extra_files.keys()])
+                return (True, lto_code_data, *[extra_files[ext] for ext in extra_files.keys()])
 
     # Create process-dependent temporary build directory
     build_dir = f"{lto_dir}_p{os.getpid()}"
@@ -303,21 +317,24 @@ def _build_lto_base(lto_symbol, compile_func, builder, extra_files=None):
         for path in temp_file_paths.values():
             if Path(path).exists():
                 Path(path).unlink()
-        raise RuntimeError(f"Failed to compile {lto_symbol}")
 
-    # Move outputs to cache
-    safe_rename(build_dir, lto_dir)
+        outputs[".lto"] = None
+        for ext in extra_files.keys():
+            outputs[ext] = None
+    else:
+        # Move outputs to cache
+        safe_rename(build_dir, lto_dir)
 
-    # If build_dir couldn't be moved by a rename, move the outputs one-by-one to lto_dir
-    if os.path.exists(lto_dir):
-        for ext, path in file_paths.items():
-            if not os.path.exists(path):
-                try:
-                    # copy output file to the destination lto dir
-                    os.rename(temp_file_paths[ext], path)
-                except (OSError, FileExistsError):
-                    # another process likely updated the lto dir first
-                    pass
+        # If build_dir couldn't be moved by a rename, move the outputs one-by-one to lto_dir
+        if os.path.exists(lto_dir):
+            for ext, path in file_paths.items():
+                if not os.path.exists(path):
+                    try:
+                        # copy output file to the destination lto dir
+                        os.rename(temp_file_paths[ext], path)
+                    except (OSError, FileExistsError):
+                        # another process likely updated the lto dir first
+                        pass
 
     # Clean up the temporary build directory
     if build_dir:
@@ -326,14 +343,13 @@ def _build_lto_base(lto_symbol, compile_func, builder, extra_files=None):
         shutil.rmtree(build_dir, ignore_errors=True)
 
     if not extra_files:
-        return (outputs[".lto"],)
+        return (result, outputs[".lto"])
     else:
-        return (outputs[".lto"], *[outputs[ext] for ext in extra_files.keys()])
+        return (result, outputs[".lto"], *[outputs[ext] for ext in extra_files.keys()])
 
 
 def build_lto_dot(M, N, K, adtype, bdtype, cdtype, alayout, blayout, clayout, arch, num_threads, builder):
-    # TODO: MathDx doesn't yet have heuristics for Blackwell
-    arch = min(arch, 90)
+    arch = 120 if arch > 121 else arch
 
     # Maps Python/Warp types to C++ types and enums
     def cublasdx_type_map(dtype):
@@ -373,7 +389,7 @@ def build_lto_dot(M, N, K, adtype, bdtype, cdtype, alayout, blayout, clayout, ar
     lto_symbol = f"dot_{M}_{N}_{K}_{arch}_{num_threads}_{a_arrangement}_{b_arrangement}_{c_arrangement}_{a_prec}_{b_prec}_{c_prec}_{element_type}"
 
     def compile_lto_dot(temp_paths):
-        result = warp.context.runtime.core.cuda_compile_dot(
+        result = warp.context.runtime.core.wp_cuda_compile_dot(
             temp_paths[".lto"].encode("utf-8"),
             lto_symbol.encode("utf-8"),
             0,
@@ -403,26 +419,58 @@ def build_lto_dot(M, N, K, adtype, bdtype, cdtype, alayout, blayout, clayout, ar
     if lto_symbol in builder.ltoirs:
         lto_code_data = builder.ltoirs[lto_symbol]
     else:
-        (lto_code_data,) = _build_lto_base(lto_symbol, compile_lto_dot, builder, {})
+        (result, lto_code_data) = _build_lto_base(lto_symbol, compile_lto_dot, builder, {})
+
+        if not result:
+            raise RuntimeError(
+                f"Failed to compile LTO '{lto_symbol}'. "
+                "Set the environment variable LIBMATHDX_LOG_LEVEL=5 and rerun for more details."
+            )
 
         # Update builder
         builder.ltoirs[lto_symbol] = lto_code_data
         builder.ltoirs_decl[lto_symbol] = (
-            f"void {lto_symbol}({c_dtype}, {a_dtype}*, {b_dtype}*, {c_dtype}, {c_dtype}*);"
+            f"void {lto_symbol}({c_dtype}*, {a_dtype}*, {b_dtype}*, {c_dtype}*, {c_dtype}*);"
         )
 
     return lto_symbol, lto_code_data
 
 
-def build_lto_solver(M, N, solver, solver_enum, fill_mode, arch, precision_enum, num_threads, parameter_list, builder):
-    # TODO: MathDx doesn't yet have heuristics for Blackwell
-    arch = min(arch, 90)
+def build_lto_solver(
+    M,
+    N,
+    NRHS,
+    solver,
+    solver_enum,
+    side_enum,
+    diag_enum,
+    alayout,
+    blayout,
+    fill_mode,
+    arch,
+    precision_enum,
+    num_threads,
+    parameter_list,
+    builder,
+    smem_estimate_bytes=None,
+):
+    arch = 120 if arch > 121 else arch
 
-    lto_symbol = f"{solver}_{M}_{N}_{arch}_{num_threads}_{precision_enum}_{fill_mode}"
+    def cusolverdx_arrangement_map(layout):
+        if layout == "colmajor":
+            return 0  # CUSOLVERDX_ARRANGEMENT_COL_MAJOR
+        if layout == "rowmajor":
+            return 1  # CUSOLVERDX_ARRANGEMENT_ROW_MAJOR
+        raise ValueError("Unsupported layout in tile_matmul")
+
+    a_arrangement = cusolverdx_arrangement_map(alayout)
+    b_arrangement = cusolverdx_arrangement_map(blayout)
+
+    lto_symbol = f"{solver}_{M}_{N}_{NRHS}_{arch}_{num_threads}_{a_arrangement}_{b_arrangement}_{precision_enum}_{side_enum if side_enum >= 0 else 'x'}_{diag_enum if diag_enum >= 0 else 'x'}_{fill_mode}"
 
     def compile_lto_solver(temp_paths):
         # compile LTO
-        result = warp.context.runtime.core.cuda_compile_solver(
+        result = warp.context.runtime.core.wp_cuda_compile_solver(
             temp_paths["_fatbin.lto"].encode("utf-8"),
             temp_paths[".lto"].encode("utf-8"),
             lto_symbol.encode("utf-8"),
@@ -432,8 +480,13 @@ def build_lto_solver(M, N, solver, solver_enum, fill_mode, arch, precision_enum,
             arch,
             M,
             N,
+            NRHS,
             solver_enum,
+            side_enum,
+            diag_enum,
             precision_enum,
+            a_arrangement,
+            b_arrangement,
             fill_mode,
             num_threads,
         )
@@ -450,9 +503,42 @@ def build_lto_solver(M, N, solver, solver_enum, fill_mode, arch, precision_enum,
     if lto_symbol in builder.ltoirs:
         lto_code_data = builder.ltoirs[lto_symbol]
     else:
-        lto_code_data, universal_fatbin_code_data = _build_lto_base(
+        (result, lto_code_data, universal_fatbin_code_data) = _build_lto_base(
             lto_symbol, compile_lto_solver, builder, {"_fatbin.lto": get_cached_lto}
         )
+
+        if not result:
+            hint = ""
+            if smem_estimate_bytes:
+                max_smem_bytes = 232448
+                max_smem_is_estimate = True
+                for d in warp.get_cuda_devices():
+                    if d.arch == arch:
+                        # We can directly query the max shared memory for this device
+                        queried_bytes = warp.context.runtime.core.wp_cuda_get_max_shared_memory(d.context)
+                        if queried_bytes > 0:
+                            max_smem_bytes = queried_bytes
+                            max_smem_is_estimate = False
+                            break
+                if smem_estimate_bytes > max_smem_bytes:
+                    source = "estimated limit" if max_smem_is_estimate else "device-reported limit"
+                    hint = (
+                        f"Estimated shared memory requirement is {smem_estimate_bytes}B, "
+                        f"but the {source} is {max_smem_bytes}B. "
+                        "The tile size(s) may be too large for this device."
+                    )
+
+            if warp.context.runtime.toolkit_version < (12, 6):
+                raise RuntimeError(
+                    "cuSolverDx requires CUDA Toolkit 12.6.3 or later. This version of Warp was built against CUDA Toolkit "
+                    f"{warp.context.runtime.toolkit_version[0]}.{warp.context.runtime.toolkit_version[1]}. "
+                    "Upgrade your CUDA Toolkit and rebuild Warp, or install a Warp wheel built with CUDA >= 12.6.3."
+                )
+            else:
+                raise RuntimeError(
+                    f"Failed to compile LTO '{lto_symbol}'. {hint}"
+                    " Set the environment variable LIBMATHDX_LOG_LEVEL=5 and rerun for more details."
+                )
 
         # Update builder
         builder.ltoirs[lto_symbol] = lto_code_data
@@ -463,15 +549,14 @@ def build_lto_solver(M, N, solver, solver_enum, fill_mode, arch, precision_enum,
 
 
 def build_lto_fft(arch, size, ept, direction, dir, precision, builder):
-    # TODO: MathDx doesn't yet have heuristics for Blackwell
-    arch = min(arch, 90)
+    arch = 120 if arch > 121 else arch
 
     lto_symbol = f"fft_{size}_{ept}_{arch}_{direction}_{precision}"
 
     def compile_lto_fft(temp_paths):
         shared_memory_size = ctypes.c_int(0)
 
-        result = warp.context.runtime.core.cuda_compile_fft(
+        result = warp.context.runtime.core.wp_cuda_compile_fft(
             temp_paths[".lto"].encode("utf-8"),
             lto_symbol.encode("utf-8"),
             0,
@@ -489,7 +574,7 @@ def build_lto_fft(arch, size, ept, direction, dir, precision, builder):
             with open(temp_paths[".lto"], "rb") as f:
                 lto_code_data = f.read()
 
-            shared_memory_bytes = Tile.round_up(shared_memory_size.value)
+            shared_memory_bytes = tile.round_up(shared_memory_size.value)
 
             # output meta file with shared memory requirements for this lto_symbol
             meta = {}
@@ -507,9 +592,15 @@ def build_lto_fft(arch, size, ept, direction, dir, precision, builder):
         lto_code_data = builder.ltoirs[lto_symbol]
         shared_memory_bytes = builder.shared_memory_bytes[lto_symbol]
     else:
-        lto_code_data, shared_memory_bytes = _build_lto_base(
+        (result, lto_code_data, shared_memory_bytes) = _build_lto_base(
             lto_symbol, compile_lto_fft, builder, {".meta": lambda path: get_cached_lto_meta(path, lto_symbol)}
         )
+
+        if not result:
+            raise RuntimeError(
+                f"Failed to compile LTO '{lto_symbol}'."
+                "Set the environment variable LIBMATHDX_LOG_LEVEL=5 and rerun for more details."
+            )
 
         # Update builder
         builder.ltoirs[lto_symbol] = lto_code_data

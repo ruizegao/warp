@@ -47,6 +47,11 @@ def linear_form(s: Sample, u: Field):
 
 
 @integrand
+def bilinear_form(s: Sample, u: Field, v: Field):
+    return u(s) * v(s)
+
+
+@integrand
 def scaled_linear_form(s: Sample, u: Field, scale: wp.array(dtype=float)):
     return u(s) * scale[0]
 
@@ -476,11 +481,8 @@ def _test_geo_cells(
     wp.atomic_add(cell_measures, s.element_index, fem.measure(domain, s) * s.qp_weight)
 
 
-@fem.integrand(kernel_options={"enable_backward": False})
-def _test_cell_lookup(
-    s: fem.Sample,
-    domain: fem.Domain,
-):
+@fem.integrand(kernel_options={"enable_backward": False, "max_unroll": 2})
+def _test_cell_lookup(s: fem.Sample, domain: fem.Domain, cell_filter: wp.array(dtype=int)):
     pos = domain(s)
 
     s_guess = fem.lookup(domain, pos, s)
@@ -490,6 +492,23 @@ def _test_cell_lookup(
     s_noguess = fem.lookup(domain, pos)
     wp.expect_eq(s_noguess.element_index, s.element_index)
     wp.expect_near(domain(s_noguess), pos, 0.001)
+
+    # Filtered lookup
+    max_dist = 10.0
+    filter_target = 1
+    s_filter = fem.lookup(domain, pos, max_dist, cell_filter, filter_target)
+    wp.expect_eq(s_filter.element_index, 0)
+
+    if s.element_index != 0:
+        # test closest point optimality
+        pos_f = domain(s_filter)
+        pos_f += 0.1 * (pos - pos_f)
+        coord_proj, _sq_dist = fem.element_closest_point(domain, s_filter.element_index, pos_f)
+        wp.expect_near(coord_proj, s_filter.element_coords, 0.001)
+
+    # test that extrapolated coordinates yield bak correct position
+    s_filter.element_coords = fem.element_coordinates(domain, s_filter.element_index, pos)
+    wp.expect_near(domain(s_filter), pos, 0.001)
 
 
 @fem.integrand(kernel_options={"enable_backward": False, "max_unroll": 1})
@@ -520,6 +539,7 @@ def _test_geo_sides(
 
     wp.expect_near(coords, inner_side_s.element_coords, 0.0001)
     wp.expect_near(coords, outer_side_s.element_coords, 0.0001)
+    wp.expect_near(coords, fem.element_coordinates(domain, side_index, pos_side), 0.001)
 
     area = fem.measure(domain, s)
     wp.atomic_add(side_measures, side_index, area * s.qp_weight)
@@ -544,7 +564,7 @@ def _test_side_normals(
         wp.expect_near(F_cross[k], nor[k], 0.0001)
 
 
-def _launch_test_geometry_kernel(geo: fem.Geometry, device, test_cell_lookup: bool = True):
+def _launch_test_geometry_kernel(geo: fem.Geometry, device):
     cell_measures = wp.zeros(dtype=float, device=device, shape=geo.cell_count())
     cell_quadrature = fem.RegularQuadrature(fem.Cells(geo), order=2)
 
@@ -557,11 +577,11 @@ def _launch_test_geometry_kernel(geo: fem.Geometry, device, test_cell_lookup: bo
             quadrature=cell_quadrature,
             values={"cell_measures": cell_measures},
         )
-        if test_cell_lookup:
-            fem.interpolate(
-                _test_cell_lookup,
-                quadrature=cell_quadrature,
-            )
+
+        cell_filter = np.zeros(geo.cell_count(), dtype=int)
+        cell_filter[0] = 1
+        cell_filter = wp.array(cell_filter, dtype=int)
+        fem.interpolate(_test_cell_lookup, quadrature=cell_quadrature, values={"cell_filter": cell_filter})
 
         fem.interpolate(
             _test_geo_sides,
@@ -637,14 +657,14 @@ def test_quad_mesh(test, device):
     with wp.ScopedDevice(device):
         positions, quad_vidx = _gen_quadmesh(N)
 
-    geo = fem.Quadmesh2D(quad_vertex_indices=quad_vidx, positions=positions)
+    geo = fem.Quadmesh2D(quad_vertex_indices=quad_vidx, positions=positions, build_bvh=True)
 
     test.assertEqual(geo.cell_count(), N**2)
     test.assertEqual(geo.vertex_count(), (N + 1) ** 2)
     test.assertEqual(geo.side_count(), 2 * (N + 1) * N)
     test.assertEqual(geo.boundary_side_count(), 4 * N)
 
-    side_measures, cell_measures = _launch_test_geometry_kernel(geo, device, test_cell_lookup=False)
+    side_measures, cell_measures = _launch_test_geometry_kernel(geo, device)
 
     assert_np_equal(side_measures.numpy(), np.full(side_measures.shape, 1.0 / (N)), tol=1.0e-4)
     assert_np_equal(cell_measures.numpy(), np.full(cell_measures.shape, 1.0 / (N**2)), tol=1.0e-4)
@@ -655,14 +675,14 @@ def test_quad_mesh(test, device):
     positions = np.hstack((positions, np.ones((positions.shape[0], 1))))
     positions = wp.array(positions, device=device, dtype=wp.vec3)
 
-    geo = fem.Quadmesh3D(quad_vertex_indices=quad_vidx, positions=positions)
+    geo = fem.Quadmesh3D(quad_vertex_indices=quad_vidx, positions=positions, build_bvh=True)
 
     test.assertEqual(geo.cell_count(), N**2)
     test.assertEqual(geo.vertex_count(), (N + 1) ** 2)
     test.assertEqual(geo.side_count(), 2 * (N + 1) * N)
     test.assertEqual(geo.boundary_side_count(), 4 * N)
 
-    side_measures, cell_measures = _launch_test_geometry_kernel(geo, device, test_cell_lookup=False)
+    side_measures, cell_measures = _launch_test_geometry_kernel(geo, device)
 
     assert_np_equal(side_measures.numpy(), np.full(side_measures.shape, 1.0 / (N)), tol=1.0e-4)
     assert_np_equal(cell_measures.numpy(), np.full(cell_measures.shape, 1.0 / (N**2)), tol=1.0e-4)
@@ -711,7 +731,7 @@ def test_hex_mesh(test, device):
     with wp.ScopedDevice(device):
         positions, tet_vidx = _gen_hexmesh(N)
 
-    geo = fem.Hexmesh(hex_vertex_indices=tet_vidx, positions=positions)
+    geo = fem.Hexmesh(hex_vertex_indices=tet_vidx, positions=positions, build_bvh=True)
 
     test.assertEqual(geo.cell_count(), (N) ** 3)
     test.assertEqual(geo.vertex_count(), (N + 1) ** 3)
@@ -719,7 +739,7 @@ def test_hex_mesh(test, device):
     test.assertEqual(geo.boundary_side_count(), 6 * N * N)
     test.assertEqual(geo.edge_count(), 3 * N * (N + 1) ** 2)
 
-    side_measures, cell_measures = _launch_test_geometry_kernel(geo, device, test_cell_lookup=False)
+    side_measures, cell_measures = _launch_test_geometry_kernel(geo, device)
 
     assert_np_equal(side_measures.numpy(), np.full(side_measures.shape, 1.0 / (N**2)), tol=1.0e-4)
     assert_np_equal(cell_measures.numpy(), np.full(cell_measures.shape, 1.0 / (N**3)), tol=1.0e-4)
@@ -818,14 +838,14 @@ def _rigid_deformation_field(s: Sample, domain: Domain, translation: wp.vec3, ro
 def test_deformed_geometry(test, device):
     N = 3
 
+    translation = [1.0, 2.0, 3.0]
+    rotation = [0.0, math.pi / 4.0, 0.0]
+    scale = 2.0
+
     with wp.ScopedDevice(device):
         positions, tet_vidx = _gen_tetmesh(N, N, N)
 
         geo = fem.Tetmesh(tet_vertex_indices=tet_vidx, positions=positions)
-
-        translation = [1.0, 2.0, 3.0]
-        rotation = [0.0, math.pi / 4.0, 0.0]
-        scale = 2.0
 
         vector_space = fem.make_polynomial_space(geo, dtype=wp.vec3, degree=2)
         pos_field = vector_space.make_field()
@@ -844,7 +864,8 @@ def test_deformed_geometry(test, device):
         test.assertEqual(geo.side_count(), 6 * (N + 1) * N**2 + (N**3) * 4)
         test.assertEqual(geo.boundary_side_count(), 12 * N * N)
 
-        side_measures, cell_measures = _launch_test_geometry_kernel(deformed_geo, device, test_cell_lookup=False)
+        deformed_geo.build_bvh()
+        side_measures, cell_measures = _launch_test_geometry_kernel(deformed_geo, device)
 
         test.assertAlmostEqual(
             np.sum(cell_measures.numpy()), scale**3, places=4, msg=f"cell_measures = {cell_measures.numpy()}"
@@ -878,6 +899,15 @@ def test_deformed_geometry(test, device):
             ],
         )
 
+
+def test_deformed_geometry_codimensional(test, device):
+    N = 3
+
+    translation = [1.0, 2.0, 3.0]
+    rotation = [0.0, math.pi / 4.0, 0.0]
+    scale = 2.0
+
+    with wp.ScopedDevice(device):
         # Test with Trimesh3d (different space and cell dimensions)
         positions, tri_vidx = _gen_trimesh(N, N)
         positions = positions.numpy()
@@ -897,7 +927,9 @@ def test_deformed_geometry(test, device):
         deformed_geo = pos_field.make_deformed_geometry()
 
         @wp.kernel
-        def _test_deformed_geometry_normal(geo_arg: geo.CellArg, def_arg: deformed_geo.CellArg, rotation: wp.vec3):
+        def _test_deformed_geometry_normal_codimensional(
+            geo_arg: geo.CellArg, def_arg: deformed_geo.CellArg, rotation: wp.vec3
+        ):
             i = wp.tid()
 
             s = make_free_sample(i, Coords(0.5, 0.5, 0.0))
@@ -908,7 +940,7 @@ def test_deformed_geometry(test, device):
             wp.expect_near(wp.quat_rotate(q, geo_n), def_n, 0.001)
 
         wp.launch(
-            _test_deformed_geometry_normal,
+            _test_deformed_geometry_normal_codimensional,
             dim=geo.cell_count(),
             inputs=[
                 geo.cell_arg_value(wp.get_device()),
@@ -1486,7 +1518,7 @@ def test_point_basis(test, device):
     point_test = fem.make_test(point_space, domain=domain)
 
     # Sample at particle positions
-    ones = fem.integrate(linear_form, fields={"u": point_test}, nodal=True)
+    ones = fem.integrate(linear_form, fields={"u": point_test}, assembly="nodal")
     test.assertAlmostEqual(np.sum(ones.numpy()), 1.0, places=5)
 
     # Sampling outside of particle positions
@@ -1602,10 +1634,21 @@ def test_particle_quadratures(test, device):
     assert_np_equal(measures.grad.numpy(), np.full(3, 4.0))  # == 1.0 / cell_area
 
 
-@fem.integrand
-def _value_at_node(s: fem.Sample, f: fem.Field, values: wp.array(dtype=float)):
+@fem.integrand(kernel_options={"enable_backward": False})
+def _value_at_node(domain: fem.Domain, s: fem.Sample, f: fem.Field, values: wp.array(dtype=float)):
+    # lookup at node is ambiguous, check that partition_lookup retains sample on current partition
+    s_partition = fem.partition_lookup(domain, domain(s))
+    wp.expect_eq(s.element_index, s_partition.element_index)
+    wp.expect_neq(fem.operator.element_partition_index(domain, s.element_index), fem.NULL_ELEMENT_INDEX)
+
     node_index = fem.operator.node_partition_index(f, s.qp_index)
     return values[node_index]
+
+
+@fem.integrand(kernel_options={"enable_backward": False})
+def _test_node_index(s: fem.Sample, u: fem.Field):
+    wp.expect_eq(fem.node_index(u, s), s.qp_index)
+    return 0.0
 
 
 def test_nodal_quadrature(test, device):
@@ -1624,15 +1667,18 @@ def test_nodal_quadrature(test, device):
 
     # test accessing data associated to a given node
 
-    piecewise_constant_space = fem.make_polynomial_space(geo, degree=0)
-    geo_partition = fem.LinearGeometryPartition(geo, 3, 4)
-    space_partition = fem.make_space_partition(piecewise_constant_space, geo_partition)
+    piecewise_constant_space = fem.make_polynomial_space(geo, degree=1)
+    geo_partition = fem.LinearGeometryPartition(geo, 2, 4)
+    assert geo_partition.cell_count() == 1
+
+    space_partition = fem.make_space_partition(piecewise_constant_space, geo_partition, with_halo=False)
+
     field = fem.make_discrete_field(piecewise_constant_space, space_partition=space_partition)
 
     partition_domain = fem.Cells(geo_partition)
     partition_nodal_quadrature = fem.NodalQuadrature(partition_domain, piecewise_constant_space)
 
-    partition_node_values = wp.array([5.0], dtype=float)
+    partition_node_values = wp.full(value=5.0, shape=space_partition.node_count(), dtype=float)
     val = fem.integrate(
         _value_at_node,
         quadrature=partition_nodal_quadrature,
@@ -1640,6 +1686,9 @@ def test_nodal_quadrature(test, device):
         values={"values": partition_node_values},
     )
     test.assertAlmostEqual(val, 5.0 / geo.cell_count(), places=5)
+
+    u_test = fem.make_test(space)
+    fem.integrate(_test_node_index, assembly="nodal", fields={"u": u_test})
 
 
 @wp.func
@@ -1823,8 +1872,6 @@ def test_vector_spaces(test, device):
             quadrature=fem.RegularQuadrature(fem.Sides(geo), order=2),
             fields={"field": div_field.trace()},
         )
-
-    return
 
     with wp.ScopedDevice(device):
         positions, tri_vidx = _gen_trimesh(3, 5)
@@ -2011,6 +2058,45 @@ def test_array_axpy(test, device):
     assert_np_equal(y.grad.numpy(), beta * np.ones(N))
 
 
+def test_integrate_high_order(test_field, device):
+    with wp.ScopedDevice(device):
+        geo = fem.Grid3D(res=(1, 1, 1))
+        space = fem.make_polynomial_space(geo, degree=4)
+        test_field = fem.make_test(space)
+        trial_field = fem.make_trial(space)
+
+        # compare consistency of tile-based "dispatch" assembly and generic
+        v0 = fem.integrate(
+            linear_form, fields={"u": test_field}, assembly="dispatch", kernel_options={"enable_backward": False}
+        )
+        v1 = fem.integrate(
+            linear_form, fields={"u": test_field}, assembly="generic", kernel_options={"enable_backward": False}
+        )
+
+        assert_np_equal(v0.numpy(), v1.numpy(), tol=1.0e-6)
+
+        h0 = fem.integrate(
+            bilinear_form,
+            fields={"v": test_field, "u": trial_field},
+            assembly="dispatch",
+            kernel_options={"enable_backward": False},
+        )
+        h1 = fem.integrate(
+            bilinear_form,
+            fields={"v": test_field, "u": trial_field},
+            assembly="generic",
+            kernel_options={"enable_backward": False},
+        )
+
+        h0_nnz = h0.nnz_sync()
+        h1_nnz = h1.nnz_sync()
+        assert h0.shape == h1.shape
+        assert h0_nnz == h1_nnz
+        assert_array_equal(h0.offsets[: h0.nrow + 1], h1.offsets[: h1.nrow + 1])
+        assert_array_equal(h0.columns[:h0_nnz], h1.columns[:h1_nnz])
+        assert_np_equal(h0.values[:h0_nnz].numpy(), h1.values[:h1_nnz].numpy(), tol=1.0e-6)
+
+
 devices = get_test_devices()
 cuda_devices = get_selected_cuda_test_devices()
 
@@ -2035,12 +2121,16 @@ add_function_test(TestFem, "test_hex_mesh", test_hex_mesh, devices=devices)
 add_function_test(TestFem, "test_nanogrid", test_nanogrid, devices=cuda_devices)
 add_function_test(TestFem, "test_adaptive_nanogrid", test_adaptive_nanogrid, devices=cuda_devices)
 add_function_test(TestFem, "test_deformed_geometry", test_deformed_geometry, devices=devices)
+add_function_test(
+    TestFem, "test_deformed_geometry_codimensional", test_deformed_geometry_codimensional, devices=devices
+)
 add_function_test(TestFem, "test_vector_spaces", test_vector_spaces, devices=devices)
 add_function_test(TestFem, "test_dof_mapper", test_dof_mapper)
 add_function_test(TestFem, "test_point_basis", test_point_basis)
 add_function_test(TestFem, "test_particle_quadratures", test_particle_quadratures)
 add_function_test(TestFem, "test_nodal_quadrature", test_nodal_quadrature)
 add_function_test(TestFem, "test_implicit_fields", test_implicit_fields)
+add_function_test(TestFem, "test_integrate_high_order", test_integrate_high_order, devices=cuda_devices)
 
 
 class TestFemUtilities(unittest.TestCase):

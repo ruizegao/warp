@@ -209,8 +209,12 @@ float balance_color_groups(float target_max_min_ratio,
     do
     {
         int biggest_group = -1, smallest_group = -1;
-
+        float prev_max_min_ratio = max_min_ratio;
         max_min_ratio = find_largest_smallest_groups(color_groups, biggest_group, smallest_group);
+
+        if (prev_max_min_ratio > 0 && prev_max_min_ratio < max_min_ratio) {
+            return max_min_ratio;
+        }
 
         // graph is not optimizable anymore or target ratio reached
         if (color_groups[biggest_group].size() - color_groups[smallest_group].size() <= 2 
@@ -372,7 +376,7 @@ public:
             // we need to update max_weight because weight_buckets[max_weight] became empty
         {
             int new_max_weight = 0;
-            for (size_t bucket_idx = max_weight - 1; bucket_idx >= 0; bucket_idx--)
+            for (int bucket_idx = max_weight - 1; bucket_idx >= 0; bucket_idx--)
             {
                 if (weight_buckets[bucket_idx].size())
                 {
@@ -535,7 +539,7 @@ using namespace wp;
 
 extern "C"
 {
-    int graph_coloring(int num_nodes, wp::array_t<int> edges, int algorithm, wp::array_t<int> node_colors)
+    int wp_graph_coloring(int num_nodes, wp::array_t<int> edges, int algorithm, wp::array_t<int> node_colors)
     {
         if (node_colors.ndim != 1 || node_colors.shape[0] != num_nodes)
         {
@@ -590,7 +594,7 @@ extern "C"
         return num_colors;
     }
 
-    float balance_coloring(int num_nodes, wp::array_t<int> edges, int num_colors, 
+    float wp_balance_coloring(int num_nodes, wp::array_t<int> edges, int num_colors, 
         float target_max_min_ratio, wp::array_t<int> node_colors)
     {
         Graph graph(num_nodes, edges);

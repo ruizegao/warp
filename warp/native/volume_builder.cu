@@ -33,28 +33,22 @@
 #endif
 namespace
 {
-/// Allocator class following interface of cub::cachingDeviceAllocator, as expected by naovdb::PointsToGrid
-struct Allocator
+/// Resource class following interface of nanovdb::DeviceResource as expected by nanovdb::PointsToGrid
+class Resource
 {
+public:
+    // cudaMalloc aligns memory to 256 bytes by default
+    static constexpr size_t DEFAULT_ALIGNMENT = 256;
 
-    cudaError_t DeviceAllocate(void **d_ptr,               ///< [out] Reference to pointer to the allocation
-                               size_t bytes,               ///< [in] Minimum number of bytes for the allocation
-                               cudaStream_t active_stream) ///< [in] The stream to be associated with this allocation
-    {
-        // in PointsToGrid stream argument always coincide with current stream, ignore
-        *d_ptr = alloc_device(WP_CURRENT_CONTEXT, bytes);
-        return cudaSuccess;
+    static void* allocateAsync(size_t bytes, size_t, cudaStream_t stream) {
+        // In PointsToGrid, the stream argument always coincides with current stream, ignore
+        void *d_ptr = wp_alloc_device(WP_CURRENT_CONTEXT, bytes);
+        cudaCheckError();
+        return d_ptr;
     }
 
-    cudaError_t DeviceFree(void *d_ptr)
-    {
-        free_device(WP_CURRENT_CONTEXT, d_ptr);
-        return cudaSuccess;
-    }
-
-    cudaError_t FreeAllCached()
-    {
-        return cudaSuccess;
+    static void deallocateAsync(void *d_ptr, size_t, size_t, cudaStream_t stream) {
+        wp_free_device(WP_CURRENT_CONTEXT, d_ptr);
     }
 };
 
@@ -69,13 +63,13 @@ class DeviceBuffer
     /// @brief Static factory method that return an instance of this buffer
     /// @param size byte size of buffer to be initialized
     /// @param dummy this argument is currently ignored but required to match the API of the HostBuffer
-    /// @param host If true buffer is initialized only on the host/CPU, else on the device/GPU
+    /// @param device id of the device on which to initialize the buffer
     /// @param stream optional stream argument (defaults to stream NULL)
     /// @return An instance of this class using move semantics
-    static DeviceBuffer create(uint64_t size, const DeviceBuffer *dummy = nullptr, bool host = true,
-                               void *stream = nullptr)
+    static DeviceBuffer create(uint64_t size, const DeviceBuffer *dummy = nullptr, int device = cudaCpuDeviceId,
+                               cudaStream_t stream = nullptr)
     {
-        return DeviceBuffer(size, host, stream);
+        return DeviceBuffer(size, device, stream);
     }
 
     /// @brief Static factory method that return an instance of this buffer that wraps externally managed memory
@@ -92,11 +86,11 @@ class DeviceBuffer
     /// @param size byte size of buffer to be initialized
     /// @param host If true buffer is initialized only on the host/CPU, else on the device/GPU
     /// @param stream optional stream argument (defaults to stream NULL)
-    DeviceBuffer(uint64_t size = 0, bool host = true, void *stream = nullptr)
+    DeviceBuffer(uint64_t size = 0, int device = cudaCpuDeviceId, cudaStream_t stream = nullptr)
         : mSize(0), mCpuData(nullptr), mGpuData(nullptr), mManaged(false)
     {
         if (size > 0)
-            this->init(size, host, stream);
+            this->init(size, device, stream);
     }
 
     DeviceBuffer(uint64_t size, void *cpuData, void *gpuData)
@@ -143,23 +137,24 @@ class DeviceBuffer
 
     /// @brief Initialize buffer
     /// @param size byte size of buffer to be initialized
-    /// @param host If true buffer is initialized only on the host/CPU, else on the device/GPU
+    /// @param device id of the device on which to initialize the buffer
     /// @note All existing buffers are first cleared
     /// @warning size is expected to be non-zero. Use clear() clear buffer!
-    void init(uint64_t size, bool host = true, void *stream = nullptr)
+    void init(uint64_t size, int device = cudaCpuDeviceId, void *stream = nullptr)
     {
         if (mSize > 0)
             this->clear(stream);
         NANOVDB_ASSERT(size > 0);
-        if (host)
+        if (device == cudaCpuDeviceId)
         {
             mCpuData =
-                alloc_pinned(size); // un-managed pinned memory on the host (can be slow to access!). Always 32B aligned
+                wp_alloc_pinned(size); // un-managed pinned memory on the host (can be slow to access!). Always 32B aligned
         }
         else
         {
-            mGpuData = alloc_device(WP_CURRENT_CONTEXT, size);
+            mGpuData = wp_alloc_device(WP_CURRENT_CONTEXT, size);
         }
+        cudaCheckError();
         mSize = size;
         mManaged = true;
     }
@@ -210,9 +205,9 @@ class DeviceBuffer
     void clear(void *stream = nullptr)
     {
         if (mManaged && mGpuData)
-            free_device(WP_CURRENT_CONTEXT, mGpuData);
+            wp_free_device(WP_CURRENT_CONTEXT, mGpuData);
         if (mManaged && mCpuData)
-            free_pinned(mCpuData);
+            wp_free_pinned(mCpuData);
         mCpuData = mGpuData = nullptr;
         mSize = 0;
         mManaged = false;
@@ -365,11 +360,11 @@ void finalize_grid(nanovdb::Grid<nanovdb::NanoTree<BuildT>> &out_grid, const Bui
     Tree *tree = &out_grid.tree();
 
     int node_counts[3];
-    memcpy_d2h(WP_CURRENT_CONTEXT, node_counts, tree->mNodeCount, sizeof(node_counts));
+    wp_memcpy_d2h(WP_CURRENT_CONTEXT, node_counts, tree->mNodeCount, sizeof(node_counts));
     // synchronization below is unnecessary as node_counts is in pageable memory.
     // keep it for clarity
-    cudaStream_t stream = static_cast<cudaStream_t>(cuda_stream_get_current());
-    cuda_stream_synchronize(stream);
+    cudaStream_t stream = static_cast<cudaStream_t>(wp_cuda_stream_get_current());
+    wp_cuda_stream_synchronize(stream);
 
     const unsigned int leaf_count = node_counts[0];
     const unsigned int lower_count = node_counts[1];
@@ -385,7 +380,7 @@ void finalize_grid(nanovdb::Grid<nanovdb::NanoTree<BuildT>> &out_grid, const Bui
         <<<upper_count, NUM_THREADS, 0, stream>>>(tree, params.background_value);
     setRootBBoxAndBackgroundValue<Tree><<<1, NUM_THREADS, 0, stream>>>(&out_grid, params.background_value);
 
-    check_cuda(cuda_context_check(WP_CURRENT_CONTEXT));
+    check_cuda(wp_cuda_context_check(WP_CURRENT_CONTEXT));
 }
 
 template <>
@@ -432,35 +427,44 @@ void build_grid_from_points(nanovdb::Grid<nanovdb::NanoTree<BuildT>> *&out_grid,
     out_grid = nullptr;
     out_grid_size = 0;
 
-    cudaStream_t stream = static_cast<cudaStream_t>(cuda_stream_get_current());
-    nanovdb::tools::cuda::PointsToGrid<BuildT, Allocator> p2g(params.map, stream);
-
-    // p2g.setVerbose(2);
-    p2g.setGridName(params.name);
-    p2g.setChecksum(nanovdb::CheckMode::Disable);
-
-    // Only compute bbox for OnIndex grids. Otherwise bbox will be computed after activating all leaf voxels
-    p2g.includeBBox(nanovdb::BuildTraits<BuildT>::is_onindex);
-
-    nanovdb::GridHandle<DeviceBuffer> grid_handle;
-
-    if (points_in_world_space)
+    try
     {
-        grid_handle = p2g.getHandle(WorldSpacePointsPtr{static_cast<const nanovdb::Vec3f *>(points), params.map}, num_points,
-                                    DeviceBuffer());
+
+        cudaStream_t stream = static_cast<cudaStream_t>(wp_cuda_stream_get_current());
+        nanovdb::tools::cuda::PointsToGrid<BuildT, Resource> p2g(params.map, stream);
+
+        // p2g.setVerbose(2);
+        p2g.setGridName(params.name);
+        p2g.setChecksum(nanovdb::CheckMode::Disable);
+
+        // Only compute bbox for OnIndex grids. Otherwise bbox will be computed after activating all leaf voxels
+        p2g.includeBBox(nanovdb::BuildTraits<BuildT>::is_onindex);
+
+        nanovdb::GridHandle<DeviceBuffer> grid_handle;
+
+        if (points_in_world_space)
+        {
+            grid_handle = p2g.getHandle(WorldSpacePointsPtr{static_cast<const nanovdb::Vec3f*>(points), params.map},
+                                        num_points, DeviceBuffer());
+        }
+        else
+        {
+            grid_handle = p2g.getHandle(static_cast<const nanovdb::Coord*>(points), num_points, DeviceBuffer());
+        }
+
+        out_grid = grid_handle.deviceGrid<BuildT>();
+        out_grid_size = grid_handle.gridSize();
+
+        finalize_grid(*out_grid, params);
+
+        // So that buffer is not destroyed when handles goes out of scope
+        grid_handle.buffer().detachDeviceData();
     }
-    else
+    catch (const std::runtime_error& exc)
     {
-        grid_handle = p2g.getHandle(static_cast<const nanovdb::Coord *>(points), num_points, DeviceBuffer());
+        out_grid = nullptr;
+        out_grid_size = 0;
     }
-
-    out_grid = grid_handle.deviceGrid<BuildT>();
-    out_grid_size = grid_handle.gridSize();
-
-    finalize_grid(*out_grid, params);
-
-    // So that buffer is not destroyed when handles goes out of scope
-    grid_handle.buffer().detachDeviceData();
 }
 
 

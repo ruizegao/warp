@@ -41,6 +41,9 @@ class Grid2DSpaceTopology(SpaceTopology):
     def topo_arg_value(self, device):
         return self.geometry.side_arg_value(device)
 
+    def fill_topo_arg(self, arg: Grid2D.SideArg, device):
+        self.geometry.fill_side_arg(arg, device)
+
     def node_count(self) -> int:
         return (
             self.geometry.vertex_count() * self._shape.VERTEX_NODE_COUNT
@@ -84,7 +87,7 @@ class Grid2DSpaceTopology(SpaceTopology):
                 axis = 1 - (node_type - SquareShapeFunction.EDGE_X)
 
                 cell = Grid2D.get_cell(cell_arg.res, element_index)
-                origin = wp.vec2i(cell[Grid2D.ROTATION[axis, 0]] + type_instance, cell[Grid2D.ROTATION[axis, 1]])
+                origin = Grid2D.orient(axis, cell) + wp.vec2i(type_instance, 0)
 
                 side = Grid2D.Side(axis, origin)
                 side_index = Grid2D.side_index(topo_arg, side)

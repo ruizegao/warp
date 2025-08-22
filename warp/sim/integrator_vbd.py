@@ -1366,7 +1366,6 @@ def VBD_solve_trimesh_no_self_contact(
     particle_ids_in_color: wp.array(dtype=wp.int32),
     prev_pos: wp.array(dtype=wp.vec3),
     pos: wp.array(dtype=wp.vec3),
-    pos_new: wp.array(dtype=wp.vec3),
     vel: wp.array(dtype=wp.vec3),
     mass: wp.array(dtype=float),
     inertia: wp.array(dtype=wp.vec3),
@@ -1380,6 +1379,8 @@ def VBD_solve_trimesh_no_self_contact(
     edge_rest_length: wp.array(dtype=float),
     edge_bending_properties: wp.array(dtype=float, ndim=2),
     adjacency: ForceElementAdjacencyInfo,
+    particle_forces: wp.array(dtype=wp.vec3),
+    particle_hessians: wp.array(dtype=wp.mat33),
     # contact info
     soft_contact_ke: float,
     soft_contact_kd: float,
@@ -1389,15 +1390,18 @@ def VBD_solve_trimesh_no_self_contact(
     has_ground: bool,
     ground: wp.array(dtype=float),
     particle_radius: wp.array(dtype=float),
+    # output
+    pos_new: wp.array(dtype=wp.vec3),
 ):
     tid = wp.tid()
 
     particle_index = particle_ids_in_color[tid]
+    particle_pos = pos[particle_index]
 
     if not particle_flags[particle_index] & PARTICLE_FLAG_ACTIVE:
+        pos_new[particle_index] = particle_pos
         return
 
-    particle_pos = pos[particle_index]
     particle_prev_pos = pos[particle_index]
 
     dt_sqr_reciprocal = 1.0 / (dt * dt)
@@ -1491,9 +1495,11 @@ def VBD_solve_trimesh_no_self_contact(
             dt,
         )
 
-        f = f + ground_contact_force
-        h = h + ground_contact_hessian
+        f += ground_contact_force
+        h += ground_contact_hessian
 
+    f += particle_forces[particle_index]
+    h += particle_hessians[particle_index]
     if abs(wp.determinant(h)) > 1e-5:
         hInv = wp.inverse(h)
         pos_new[particle_index] = particle_pos + hInv * f
@@ -1777,7 +1783,6 @@ def VBD_solve_trimesh_with_self_contact_penetration_free(
     particle_ids_in_color: wp.array(dtype=wp.int32),
     pos_prev: wp.array(dtype=wp.vec3),
     pos: wp.array(dtype=wp.vec3),
-    pos_new: wp.array(dtype=wp.vec3),
     vel: wp.array(dtype=wp.vec3),
     mass: wp.array(dtype=float),
     inertia: wp.array(dtype=wp.vec3),
@@ -1803,6 +1808,8 @@ def VBD_solve_trimesh_with_self_contact_penetration_free(
     friction_mu: float,
     friction_epsilon: float,
     particle_radius: wp.array(dtype=float),
+    # output
+    pos_new: wp.array(dtype=wp.vec3),
 ):
     t_id = wp.tid()
 
@@ -1811,6 +1818,7 @@ def VBD_solve_trimesh_with_self_contact_penetration_free(
     particle_prev_pos = pos_prev[particle_index]
 
     if not particle_flags[particle_index] & PARTICLE_FLAG_ACTIVE:
+        pos_new[particle_index] = particle_pos
         return
 
     dt_sqr_reciprocal = 1.0 / (dt * dt)
@@ -2134,6 +2142,8 @@ class VBDIntegrator(Integrator):
         )
 
         for _iter in range(self.iterations):
+            self.particle_forces.zero_()
+            self.particle_hessians.zero_()
             for color in range(len(self.model.particle_color_groups)):
                 wp.launch(
                     kernel=VBD_accumulate_contact_force_and_hessian_no_self_contact,
@@ -2174,7 +2184,6 @@ class VBDIntegrator(Integrator):
                         self.model.particle_color_groups[color],
                         self.particle_q_prev,
                         state_in.particle_q,
-                        state_out.particle_q,
                         state_in.particle_qd,
                         self.model.particle_mass,
                         self.inertia,
@@ -2188,6 +2197,8 @@ class VBDIntegrator(Integrator):
                         self.model.edge_rest_length,
                         self.model.edge_bending_properties,
                         self.adjacency,
+                        self.particle_forces,
+                        self.particle_hessians,
                         self.model.soft_contact_ke,
                         self.model.soft_contact_kd,
                         self.model.soft_contact_mu,
@@ -2196,6 +2207,9 @@ class VBDIntegrator(Integrator):
                         self.model.ground,
                         self.model.ground_plane,
                         self.model.particle_radius,
+                    ],
+                    outputs=[
+                        state_out.particle_q,
                     ],
                     dim=self.model.particle_color_groups[color].size,
                     device=self.device,
@@ -2294,7 +2308,6 @@ class VBDIntegrator(Integrator):
                         self.model.particle_color_groups[color],
                         self.particle_q_prev,
                         state_in.particle_q,
-                        state_out.particle_q,
                         state_in.particle_qd,
                         self.model.particle_mass,
                         self.inertia,
@@ -2319,6 +2332,9 @@ class VBDIntegrator(Integrator):
                         self.model.soft_contact_mu,
                         self.friction_epsilon,
                         self.model.particle_radius,
+                    ],
+                    outputs=[
+                        state_out.particle_q,
                     ],
                     device=self.device,
                 )
